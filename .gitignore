@@ -1,0 +1,7 @@
+target/
+app/dist/
+app/src-tauri/gen/
+app/src-tauri/icons/
+.env
+*.jks
+*.log

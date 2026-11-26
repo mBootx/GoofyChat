@@ -1,0 +1,68 @@
+name: goofychat
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+      network: host
+    image: goofychat-server
+    restart: unless-stopped
+    environment:
+      TURN_HOST: ${TURN_HOST}
+      TURN_SECRET: ${TURN_SECRET}
+      MAX_UPLOAD_MB: "100"
+      USER_QUOTA_MB: "2048"
+      TOTAL_QUOTA_MB: "51200"
+    volumes:
+      - data:/data
+    ports:
+      # LAN address used by Nginx Proxy Manager. Do not forward this port on the router.
+      - "${LAN_IP}:8880:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 512m
+
+  turn:
+    image: coturn/coturn:4.9
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - -n
+      - --log-file=stdout
+      - --listening-port=7880
+      - --min-port=10000
+      - --max-port=10100
+      # IPv4 only: IPv6 LAN addresses are public and would escape the deny list.
+      - --relay-ip=${LAN_IP}
+      - --external-ip=${PUBLIC_IP}/${LAN_IP}
+      - --realm=${TURN_HOST}
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET}
+      - --fingerprint
+      - --no-tls
+      - --no-dtls
+      - --no-cli
+      - --no-multicast-peers
+      - --no-tcp-relay
+      - --user-quota=8
+      - --total-quota=100
+      - --max-bps=500000
+      - --bps-capacity=3000000
+      # Never relay towards the host, the LAN or Docker networks.
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=${PUBLIC_IP}
+      - --denied-peer-ip=::1
+      - --denied-peer-ip=::ffff:0:0-::ffff:ffff:ffff
+      - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+volumes:
+  data:
