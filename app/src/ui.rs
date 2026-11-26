@@ -1,5 +1,6 @@
-//! Small shared pieces: icons, avatars, dates.
+//! Small shared pieces: icons, avatars, previews, dates.
 
+use crate::api;
 use dioxus::prelude::*;
 use wasm_bindgen::JsValue;
 
@@ -18,13 +19,15 @@ pub fn Icon(name: &'static str) -> Element {
         "videooff" => "M3 3l18 18M16 11V7a2 2 0 0 0-2-2h-4M4 5H3a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2M23 7l-7 5 7 5z",
         "phone" => "M22 17v3a2 2 0 0 1-2 2A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 1.7l.7 3a2 2 0 0 1-.5 2L8 9.9a16 16 0 0 0 6 6l1.3-1.2a2 2 0 0 1 2-.5l3 .7A2 2 0 0 1 22 17z",
         "hangup" => "M6 6l12 12M18 6L6 18",
+        "more" => "M12 5v.01M12 12v.01M12 19v.01",
+        "settings" => "M4 6h10M18 6h2M4 12h2M10 12h10M4 18h12M20 18h0M16 4v4M8 10v4M18 16v4",
         _ => "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
     };
     rsx! { svg { view_box: "0 0 24 24", path { d: path } } }
 }
 
 #[component]
-pub fn Avatar(name: String, #[props(default)] small: bool) -> Element {
+pub fn Avatar(name: String, #[props(default)] photo: Option<String>, #[props(default)] small: bool) -> Element {
     let initials: String = name
         .split_whitespace()
         .take(2)
@@ -36,8 +39,27 @@ pub fn Avatar(name: String, #[props(default)] small: bool) -> Element {
         div {
             class: if small { "avatar small" } else { "avatar" },
             style: "background: hsl({hue} 60% 52%)",
-            "{initials}"
+            if let Some(id) = photo {
+                img { src: api::media_url(&id), alt: "" }
+            } else {
+                "{initials}"
+            }
         }
+    }
+}
+
+/// One line describing a message, for previews and quotes.
+pub fn summary(body: &str, mime: Option<&str>, deleted: bool) -> String {
+    if deleted {
+        return "Message supprimé".into();
+    }
+    if !body.is_empty() {
+        return body.into();
+    }
+    match mime.and_then(|m| m.split('/').next()) {
+        Some("image") => "📷 Photo".into(),
+        Some("video") => "🎬 Vidéo".into(),
+        _ => "🎤 Audio".into(),
     }
 }
 

@@ -55,9 +55,12 @@ class MainActivity : TauriActivity() {
         }
     }
 
+    private val updater by lazy { Updater(this) }
+
     override fun onResume() {
         super.onResume()
         visible = true
+        updater.resume()
     }
 
     override fun onPause() {

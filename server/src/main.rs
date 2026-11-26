@@ -1,7 +1,9 @@
+mod account;
 mod api;
 mod auth;
 mod error;
 mod media;
+mod messages;
 mod state;
 mod ws;
 

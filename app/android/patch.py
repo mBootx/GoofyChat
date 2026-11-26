@@ -16,7 +16,7 @@ def replace_once(path, old, new):
 
 
 java = app / "src/main/java/org/goofyfiles/chat"
-for name in ("MainActivity.kt", "ChatService.kt"):
+for name in ("MainActivity.kt", "ChatService.kt", "BootReceiver.kt", "Updater.kt"):
     shutil.copy(here / name, java / name)
 
 manifest = app / "src/main/AndroidManifest.xml"
@@ -33,6 +33,8 @@ permissions = "".join(
         "FOREGROUND_SERVICE_MICROPHONE",
         "FOREGROUND_SERVICE_CAMERA",
         "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+        "RECEIVE_BOOT_COMPLETED",
+        "REQUEST_INSTALL_PACKAGES",
     )
 )
 features = "".join(
@@ -48,6 +50,13 @@ service = """    <service
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Self-hosted chat: keeps a connection to receive messages and calls" />
         </service>
+        <receiver android:name=".BootReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <receiver android:name=".InstallReceiver" android:exported="false" />
     </application>"""
 replace_once(manifest, "</application>", service)
 

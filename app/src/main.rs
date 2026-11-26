@@ -2,13 +2,14 @@ mod api;
 mod chat;
 mod js;
 mod screens;
+mod settings;
 mod ui;
 
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use futures_channel::mpsc;
 use futures_util::StreamExt;
-use proto::{Conversation, Message, ServerEvent, Session};
+use proto::{Conversation, Message, ServerEvent, Session, User};
 use serde::Deserialize;
 use wasm_bindgen::{prelude::Closure, JsValue};
 
@@ -20,6 +21,7 @@ fn main() {
 pub enum Screen {
     Home,
     New,
+    Settings,
     Chat(i64),
 }
 
@@ -43,6 +45,10 @@ pub struct Ctx {
     /// Messages of the open conversation.
     pub messages: Signal<Vec<Message>>,
     pub toast: Signal<String>,
+    /// People this user blocked.
+    pub blocked: Signal<Vec<User>>,
+    /// Who is typing in the open conversation, with the time they last did.
+    pub typing: Signal<Vec<(i64, f64)>>,
 }
 
 impl Ctx {
@@ -81,13 +87,42 @@ impl Ctx {
         self.screen.set(Screen::Home);
         self.conversations.set(vec![]);
         self.messages.set(vec![]);
+        self.blocked.set(vec![]);
+        self.typing.set(vec![]);
     }
 
     pub async fn refresh(mut self) {
-        match api::get(&self.token(), "/api/conversations").await {
-            Ok(list) => self.conversations.set(list),
+        match api::get::<Vec<Conversation>>(&self.token(), "/api/conversations").await {
+            Ok(list) => {
+                let open = self.screen.peek().clone();
+                // The open conversation may be gone: left, or its other member deleted.
+                let gone = matches!(open, Screen::Chat(id) if !list.iter().any(|c| c.id == id));
+                self.conversations.set(list);
+                if gone {
+                    // Set first so a second refresh does not go back twice.
+                    self.screen.set(Screen::Home);
+                    js::pop_screen();
+                }
+            }
             Err(e) => self.fail(e),
         }
+    }
+
+    pub async fn load_blocked(mut self) {
+        match api::get(&self.token(), "/api/blocks").await {
+            Ok(list) => self.blocked.set(list),
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// Keeps the stored session in step with a profile change.
+    pub fn set_user(mut self, user: User) {
+        let Some(mut session) = self.session.peek().clone() else { return };
+        session.user = user;
+        if let Ok(json) = serde_json::to_string(&session) {
+            js::save_session(&json);
+        }
+        self.session.set(Some(session));
     }
 
     pub fn open(mut self, screen: Screen) {
@@ -95,6 +130,7 @@ impl Ctx {
             js::push_screen();
         }
         self.messages.set(vec![]);
+        self.typing.set(vec![]);
         self.screen.set(screen.clone());
         if let Screen::Chat(id) = screen {
             // Outlives the screen that asked for it.
@@ -133,19 +169,55 @@ impl Ctx {
         js::scroll_bottom("messages");
     }
 
-    async fn handle(self, event: ServerEvent) {
+    /// Applies a reaction or a deletion to the open conversation.
+    pub fn update_message(mut self, updated: Message) {
+        if *self.screen.peek() != Screen::Chat(updated.conversation_id) {
+            return;
+        }
+        for message in self.messages.write().iter_mut() {
+            if message.id == updated.id {
+                *message = updated.clone();
+            } else if updated.deleted {
+                if let Some(quote) = message.reply.as_mut().filter(|q| q.id == updated.id) {
+                    quote.deleted = true;
+                    quote.body.clear();
+                }
+            }
+        }
+    }
+
+    fn typing_from(mut self, user_id: i64) {
+        let now = js_sys::Date::now();
+        self.typing.write().retain(|t| t.0 != user_id);
+        self.typing.write().push((user_id, now));
+        spawn_forever(async move {
+            gloo_timers::future::TimeoutFuture::new(5000).await;
+            // A later keystroke has a later time and keeps the indicator.
+            if self.typing.peek().contains(&(user_id, now)) {
+                self.typing.write().retain(|t| t.0 != user_id);
+            }
+        });
+    }
+
+    async fn handle(mut self, event: ServerEvent) {
         match event {
             ServerEvent::Ready => {
                 // (Re)connected: catch up on anything missed.
+                self.load_blocked().await;
                 let open = self.screen.peek().clone();
                 match open {
-                    Screen::Chat(id) => self.load(id).await,
+                    Screen::Chat(id) => {
+                        self.refresh().await;
+                        self.load(id).await
+                    }
                     _ => self.refresh().await,
                 }
             }
             ServerEvent::Message { message } => {
                 let id = message.conversation_id;
                 let open = *self.screen.peek() == Screen::Chat(id);
+                let sender = message.sender.id;
+                self.typing.write().retain(|t| t.0 != sender);
                 self.push_message(message);
                 if open {
                     self.read(id).await;
@@ -153,7 +225,33 @@ impl Ctx {
                     self.refresh().await;
                 }
             }
-            ServerEvent::Conversation { .. } => self.refresh().await,
+            ServerEvent::Update { message } => {
+                let deleted = message.deleted;
+                self.update_message(message);
+                // Previews and unread counts only change on deletion.
+                if deleted {
+                    self.refresh().await;
+                }
+            }
+            ServerEvent::Conversation { id } => {
+                self.load_blocked().await;
+                self.refresh().await;
+                // Members or their profiles changed.
+                if *self.screen.peek() == Screen::Chat(id) {
+                    self.load(id).await;
+                }
+            }
+            ServerEvent::Read { conversation_id, mark } => {
+                if let Some(c) = self.conversations.write().iter_mut().find(|c| c.id == conversation_id) {
+                    c.reads.retain(|r| r.user_id != mark.user_id);
+                    c.reads.push(mark);
+                };
+            }
+            ServerEvent::Typing { conversation_id, user_id } => {
+                if *self.screen.peek() == Screen::Chat(conversation_id) {
+                    self.typing_from(user_id);
+                }
+            }
             ServerEvent::Call { .. } | ServerEvent::Pong => {}
         }
     }
@@ -176,6 +274,8 @@ fn App() -> Element {
         conversations: Signal::new(vec![]),
         messages: Signal::new(vec![]),
         toast: Signal::new(String::new()),
+        blocked: Signal::new(vec![]),
+        typing: Signal::new(vec![]),
     });
     let mut call = use_signal(CallView::default);
 
@@ -206,11 +306,13 @@ fn App() -> Element {
         });
     });
 
-    // Live connection, tied to the session.
+    // Live connection, tied to the session. A profile change must not reconnect,
+    // which would end a call, so only the identity is watched.
+    let identity = use_memo(move || ctx.session.read().as_ref().map(|s| (s.token.clone(), s.user.id)));
     use_effect(move || {
-        let Some(session) = ctx.session.read().clone() else { return };
+        let Some((token, user_id)) = identity() else { return };
         let (callback, mut events) = channel();
-        js::connect(api::SERVER, &session.token, session.user.id as f64, &callback);
+        js::connect(api::SERVER, &token, user_id as f64, &callback);
         spawn_forever(async move {
             while let Some(json) = events.next().await {
                 if let Ok(event) = serde_json::from_str::<ServerEvent>(&json) {
@@ -231,6 +333,7 @@ fn App() -> Element {
             match screen {
                 Screen::Home => rsx! { screens::Home {} },
                 Screen::New => rsx! { screens::NewChat {} },
+                Screen::Settings => rsx! { settings::Settings {} },
                 Screen::Chat(id) => rsx! { chat::Chat { key: "{id}", id } },
             }
         }

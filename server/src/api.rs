@@ -1,14 +1,17 @@
+//! Routes, user search, conversations and call relay credentials.
+
 use crate::{
-    auth::{self, now_ms, Auth},
+    account,
+    auth::{self, now_ms, Auth, UserRow},
     error::{bad, not_found, Error, Result},
-    media,
+    media, messages,
     state::AppState,
     ws,
 };
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use base64::Engine;
@@ -25,11 +28,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/register", post(auth::register))
         .route("/api/login", post(auth::login))
         .route("/api/logout", post(auth::logout))
-        .route("/api/me", get(me))
+        .route("/api/me", get(me).put(account::update_profile))
+        .route("/api/account/delete", post(account::delete_account))
         .route("/api/users", get(search_users))
+        .route("/api/blocks", get(account::blocked))
+        .route("/api/blocks/{id}", put(account::block).delete(account::unblock))
         .route("/api/conversations", get(list_conversations).post(create_conversation))
-        .route("/api/conversations/{id}/messages", get(history).post(send_message))
-        .route("/api/conversations/{id}/read", post(mark_read))
+        .route("/api/conversations/{id}/messages", get(messages::history).post(messages::send))
+        .route("/api/conversations/{id}/read", post(messages::mark_read))
+        .route("/api/conversations/{id}/leave", post(leave))
+        .route("/api/messages/{id}", delete(messages::delete))
+        .route("/api/messages/{id}/reaction", put(messages::react))
         .route("/api/media", post(media::upload).layer(DefaultBodyLimit::max(upload_limit)))
         .route("/api/media/{id}", get(media::download))
         .route("/api/ice", get(ice))
@@ -41,6 +50,18 @@ pub fn router(state: AppState) -> Router {
 
 async fn me(Auth(user): Auth) -> Json<User> {
     Json(user)
+}
+
+/// Whether either user blocked the other.
+pub async fn is_blocked(state: &AppState, a: i64, b: i64) -> Result<bool> {
+    let found = sqlx::query(
+        "SELECT 1 FROM blocks WHERE (user_id = ?1 AND blocked_id = ?2) OR (user_id = ?2 AND blocked_id = ?1)",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(found.is_some())
 }
 
 #[derive(Deserialize)]
@@ -58,19 +79,18 @@ async fn search_users(
         return Ok(Json(vec![]));
     }
     let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-    let rows: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT id, username, display_name FROM users
-         WHERE id != ? AND username LIKE ? ESCAPE '\\' ORDER BY username LIMIT 20",
+    let rows: Vec<UserRow> = sqlx::query_as(
+        "SELECT id, username, display_name, avatar FROM users
+         WHERE id != ?1 AND username LIKE ?2 ESCAPE '\\'
+           AND id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?1)
+           AND id NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?1)
+         ORDER BY username LIMIT 20",
     )
     .bind(user.id)
     .bind(format!("{escaped}%"))
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(rows.into_iter().map(to_user).collect()))
-}
-
-fn to_user((id, username, display_name): (i64, String, String)) -> User {
-    User { id, username, display_name }
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
 
 pub async fn member_ids(state: &AppState, conversation: i64) -> Result<Vec<i64>> {
@@ -82,7 +102,7 @@ pub async fn member_ids(state: &AppState, conversation: i64) -> Result<Vec<i64>>
 }
 
 /// Returns the member ids, or 404 when the user is not part of the conversation.
-async fn require_member(state: &AppState, conversation: i64, user: i64) -> Result<Vec<i64>> {
+pub async fn require_member(state: &AppState, conversation: i64, user: i64) -> Result<Vec<i64>> {
     let ids = member_ids(state, conversation).await?;
     if ids.contains(&user) {
         Ok(ids)
@@ -91,43 +111,6 @@ async fn require_member(state: &AppState, conversation: i64, user: i64) -> Resul
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct MessageRow {
-    id: i64,
-    conversation_id: i64,
-    body: String,
-    created_at: i64,
-    sender_id: i64,
-    username: String,
-    display_name: String,
-    media_id: Option<String>,
-    mime: Option<String>,
-    name: Option<String>,
-    size: Option<i64>,
-}
-
-impl From<MessageRow> for Message {
-    fn from(r: MessageRow) -> Self {
-        let media = match (r.media_id, r.mime, r.name, r.size) {
-            (Some(id), Some(mime), Some(name), Some(size)) => Some(Media { id, mime, name, size }),
-            _ => None,
-        };
-        Message {
-            id: r.id,
-            conversation_id: r.conversation_id,
-            sender: User { id: r.sender_id, username: r.username, display_name: r.display_name },
-            body: r.body,
-            media,
-            created_at: r.created_at,
-        }
-    }
-}
-
-const MESSAGE_SELECT: &str = "SELECT m.id, m.conversation_id, m.body, m.created_at,
-    u.id AS sender_id, u.username, u.display_name,
-    f.id AS media_id, f.mime, f.name, f.size
-    FROM messages m JOIN users u ON u.id = m.sender_id LEFT JOIN media f ON f.id = m.media_id";
-
 async fn list_conversations(
     State(state): State<AppState>,
     Auth(user): Auth,
@@ -135,7 +118,7 @@ async fn list_conversations(
     let rows: Vec<(i64, String, bool, i64, i64)> = sqlx::query_as(
         "SELECT c.id, c.name, c.is_group, c.created_at,
            (SELECT COUNT(*) FROM messages x WHERE x.conversation_id = c.id
-              AND x.id > me.last_read AND x.sender_id != me.user_id)
+              AND x.id > me.last_read AND x.sender_id != me.user_id AND x.deleted = 0)
          FROM conversations c JOIN members me ON me.conversation_id = c.id
          WHERE me.user_id = ?",
     )
@@ -144,20 +127,19 @@ async fn list_conversations(
     .await?;
     let mut list = Vec::with_capacity(rows.len());
     for (id, name, is_group, created_at, unread) in rows {
-        let members: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT u.id, u.username, u.display_name FROM members m
+        let members: Vec<UserRow> = sqlx::query_as(
+            "SELECT u.id, u.username, u.display_name, u.avatar FROM members m
              JOIN users u ON u.id = m.user_id WHERE m.conversation_id = ? ORDER BY u.display_name",
         )
         .bind(id)
         .fetch_all(&state.db)
         .await?;
-        let last: Option<MessageRow> = sqlx::query_as(&format!(
-            "{MESSAGE_SELECT} WHERE m.conversation_id = ? ORDER BY m.id DESC LIMIT 1"
-        ))
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
-        let last_message: Option<Message> = last.map(Into::into);
+        let reads: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT user_id, last_read FROM members WHERE conversation_id = ?")
+                .bind(id)
+                .fetch_all(&state.db)
+                .await?;
+        let last_message = messages::last(&state, id).await?;
         let activity = last_message.as_ref().map_or(created_at, |m| m.created_at);
         list.push((
             activity,
@@ -165,9 +147,13 @@ async fn list_conversations(
                 id,
                 name,
                 is_group,
-                members: members.into_iter().map(to_user).collect(),
+                members: members.into_iter().map(Into::into).collect(),
                 last_message,
                 unread,
+                reads: reads
+                    .into_iter()
+                    .map(|(user_id, message_id)| ReadMark { user_id, message_id })
+                    .collect(),
             },
         ));
     }
@@ -192,12 +178,15 @@ async fn create_conversation(
     if others.is_empty() || others.len() > 49 {
         return Err(bad("Choisissez entre 1 et 49 personnes."));
     }
-    for id in &others {
+    for &id in &others {
         sqlx::query("SELECT 1 FROM users WHERE id = ?")
             .bind(id)
             .fetch_optional(&state.db)
             .await?
             .ok_or_else(|| bad("Utilisateur introuvable."))?;
+        if is_blocked(&state, user.id, id).await? {
+            return Err(Error(StatusCode::FORBIDDEN, "Impossible d'ajouter cette personne.".into()));
+        }
     }
     let name = input.name.map(|n| n.trim().chars().take(60).collect::<String>()).unwrap_or_default();
     let is_group = !name.is_empty() || others.len() > 1;
@@ -245,91 +234,48 @@ async fn create_conversation(
     Ok(Json(Created { id }))
 }
 
-#[derive(Deserialize)]
-struct Page {
-    before: Option<i64>,
-}
-
-async fn history(
-    State(state): State<AppState>,
-    Auth(user): Auth,
-    Path(id): Path<i64>,
-    Query(page): Query<Page>,
-) -> Result<Json<Vec<Message>>> {
-    require_member(&state, id, user.id).await?;
-    let rows: Vec<MessageRow> = sqlx::query_as(&format!(
-        "{MESSAGE_SELECT} WHERE m.conversation_id = ? AND m.id < ? ORDER BY m.id DESC LIMIT 50"
-    ))
-    .bind(id)
-    .bind(page.before.unwrap_or(i64::MAX))
-    .fetch_all(&state.db)
-    .await?;
-    Ok(Json(rows.into_iter().rev().map(Into::into).collect()))
-}
-
-async fn send_message(
-    State(state): State<AppState>,
-    Auth(user): Auth,
-    Path(id): Path<i64>,
-    Json(input): Json<NewMessage>,
-) -> Result<Json<Message>> {
-    let members = require_member(&state, id, user.id).await?;
-    let body = input.body.trim().to_string();
-    if body.is_empty() && input.media_id.is_none() {
-        return Err(bad("Message vide."));
-    }
-    if body.chars().count() > 4000 {
-        return Err(bad("Message trop long."));
-    }
-    if !state.allow(user.id.to_string(), "message", 60, Duration::from_secs(60))
-        || !state.allow(user.id.to_string(), "message-day", 3000, Duration::from_secs(86400))
-    {
-        return Err(Error(StatusCode::TOO_MANY_REQUESTS, "Doucement ! Patientez un instant.".into()));
-    }
-    if let Some(media_id) = &input.media_id {
-        // Only the uploader may attach a file.
-        sqlx::query("SELECT 1 FROM media WHERE id = ? AND owner_id = ?")
-            .bind(media_id)
-            .bind(user.id)
-            .fetch_optional(&state.db)
-            .await?
-            .ok_or_else(|| bad("Fichier introuvable."))?;
-    }
-    let message_id = sqlx::query(
-        "INSERT INTO messages (conversation_id, sender_id, body, media_id, created_at) VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(id)
-    .bind(user.id)
-    .bind(&body)
-    .bind(&input.media_id)
-    .bind(now_ms())
-    .execute(&state.db)
-    .await?
-    .last_insert_rowid();
-    let row: MessageRow = sqlx::query_as(&format!("{MESSAGE_SELECT} WHERE m.id = ?"))
-        .bind(message_id)
-        .fetch_one(&state.db)
-        .await?;
-    let message: Message = row.into();
-    state.send(&members, &ServerEvent::Message { message: message.clone() });
-    Ok(Json(message))
-}
-
-async fn mark_read(
+/// Leaves a group. The last member to leave deletes it.
+async fn leave(
     State(state): State<AppState>,
     Auth(user): Auth,
     Path(id): Path<i64>,
 ) -> Result<StatusCode> {
-    require_member(&state, id, user.id).await?;
-    sqlx::query(
-        "UPDATE members SET last_read =
-           COALESCE((SELECT MAX(id) FROM messages WHERE conversation_id = ?1), 0)
-         WHERE conversation_id = ?1 AND user_id = ?2",
+    let members = require_member(&state, id, user.id).await?;
+    let (is_group,): (bool,) = sqlx::query_as("SELECT is_group FROM conversations WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    if !is_group {
+        return Err(bad("Seuls les groupes peuvent être quittés."));
+    }
+    let files: Vec<(String,)> = sqlx::query_as(
+        "SELECT media_id FROM messages WHERE conversation_id = ? AND media_id IS NOT NULL",
     )
     .bind(id)
-    .bind(user.id)
-    .execute(&state.db)
+    .fetch_all(&state.db)
     .await?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM members WHERE conversation_id = ? AND user_id = ?")
+        .bind(id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    let emptied = sqlx::query(
+        "DELETE FROM conversations WHERE id = ?1
+         AND NOT EXISTS (SELECT 1 FROM members WHERE conversation_id = ?1)",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    tx.commit().await?;
+    if emptied {
+        for (file,) in files {
+            media::discard(&state, &file).await?;
+        }
+    }
+    state.send(&members, &ServerEvent::Conversation { id });
     Ok(StatusCode::NO_CONTENT)
 }
 

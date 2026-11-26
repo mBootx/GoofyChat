@@ -1,4 +1,4 @@
-//! Sign in, conversation list and new conversation.
+//! Sign up and in, conversation list and new conversation.
 
 use crate::{
     api, js,
@@ -15,6 +15,7 @@ pub fn Auth() -> Element {
     let mut username = use_signal(String::new);
     let mut display = use_signal(String::new);
     let mut password = use_signal(String::new);
+    let mut invite = use_signal(String::new);
     let mut error = use_signal(String::new);
     let mut busy = use_signal(|| false);
 
@@ -28,7 +29,12 @@ pub fn Auth() -> Element {
         let mut session = ctx.session;
         spawn(async move {
             let result: Result<Session, api::Failure> = if registering() {
-                let body = Register { username: username(), display_name: display(), password: password() };
+                let body = Register {
+                    username: username(),
+                    display_name: display(),
+                    password: password(),
+                    invite: invite(),
+                };
                 api::post("", "/api/register", &body).await
             } else {
                 let body = Login { username: username(), password: password() };
@@ -60,6 +66,10 @@ pub fn Auth() -> Element {
             }
             input { class: "field", r#type: "password", placeholder: "Mot de passe (8 caractères min.)",
                 value: "{password}", oninput: move |e| password.set(e.value()) }
+            if registering() {
+                input { class: "field", placeholder: "Code d'invitation (si demandé)", autocapitalize: "none",
+                    value: "{invite}", oninput: move |e| invite.set(e.value()) }
+            }
             if !error().is_empty() {
                 div { class: "error", "{error}" }
             }
@@ -86,15 +96,18 @@ pub fn title(conversation: &Conversation, me: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Profile photo of the other person in a one-to-one conversation.
+pub fn photo(conversation: &Conversation, me: i64) -> Option<String> {
+    if conversation.is_group {
+        return None;
+    }
+    conversation.members.iter().find(|u| u.id != me).and_then(|u| u.avatar.clone())
+}
+
 fn preview(c: &Conversation) -> String {
     match &c.last_message {
         None => "Aucun message".into(),
-        Some(m) if !m.body.is_empty() => m.body.clone(),
-        Some(m) => match m.media.as_ref().map(|f| f.mime.split('/').next().unwrap_or("")) {
-            Some("image") => "📷 Photo".into(),
-            Some("video") => "🎬 Vidéo".into(),
-            _ => "🎤 Audio".into(),
-        },
+        Some(m) => ui::summary(&m.body, m.media.as_ref().map(|f| f.mime.as_str()), m.deleted),
     }
 }
 
@@ -104,27 +117,15 @@ pub fn Home() -> Element {
     let me = ctx.my_id();
     let name = ctx.session.read().as_ref().map(|s| s.user.display_name.clone()).unwrap_or_default();
     let username = ctx.session.read().as_ref().map(|s| s.user.username.clone()).unwrap_or_default();
+    let avatar = ctx.session.read().as_ref().and_then(|s| s.user.avatar.clone());
     let conversations = ctx.conversations.read().clone();
-    let mut confirm = use_signal(|| false);
-
-    let logout = move |_| {
-        if !confirm() {
-            confirm.set(true);
-            ctx.notify("Touchez à nouveau pour vous déconnecter.");
-            return;
-        }
-        spawn(async move {
-            let _ = api::post_empty(&ctx.token(), "/api/logout").await;
-            ctx.sign_out();
-        });
-    };
 
     rsx! {
         div { class: "screen",
             header {
-                Avatar { name: name.clone(), small: true }
+                Avatar { name: name.clone(), photo: avatar, small: true }
                 h2 { "Discussions" small { "@{username}" } }
-                button { class: "icon", onclick: logout, Icon { name: "logout" } }
+                button { class: "icon", onclick: move |_| ctx.open(Screen::Settings), Icon { name: "settings" } }
             }
             div { class: "list",
                 if conversations.is_empty() {
@@ -132,7 +133,7 @@ pub fn Home() -> Element {
                 }
                 for c in conversations {
                     button { key: "{c.id}", class: "row", onclick: move |_| ctx.open(Screen::Chat(c.id)),
-                        Avatar { name: title(&c, me) }
+                        Avatar { name: title(&c, me), photo: photo(&c, me) }
                         div { class: "main",
                             div { class: "title", "{title(&c, me)}" }
                             div { class: "sub", "{preview(&c)}" }
@@ -235,7 +236,7 @@ pub fn NewChat() -> Element {
                                 }
                             }
                         },
-                        Avatar { name: u.display_name.clone() }
+                        Avatar { name: u.display_name.clone(), photo: u.avatar.clone() }
                         div { class: "main",
                             div { class: "title", "{u.display_name}" }
                             div { class: "sub", "@{u.username}" }

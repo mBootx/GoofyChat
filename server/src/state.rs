@@ -17,6 +17,8 @@ pub struct Config {
     /// Host name of the TURN server, empty to disable.
     pub turn_host: String,
     pub turn_secret: String,
+    /// Required to create an account, empty for open sign-up.
+    pub invite_code: String,
 }
 
 impl Config {
@@ -30,8 +32,29 @@ impl Config {
             total_quota: mb("TOTAL_QUOTA_MB", "51200"),
             turn_host: var("TURN_HOST", ""),
             turn_secret: var("TURN_SECRET", ""),
+            invite_code: var("INVITE_CODE", "").trim().to_string(),
         }
     }
+}
+
+/// Adds the columns missing from a database created by an earlier version.
+pub async fn migrate(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    const COLUMNS: &[(&str, &str, &str)] = &[
+        ("users", "avatar", "TEXT"),
+        ("messages", "reply_to", "INTEGER"),
+        ("messages", "deleted", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (table, column, kind) in COLUMNS {
+        let found = sqlx::query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?")
+            .bind(table)
+            .bind(column)
+            .fetch_optional(db)
+            .await?;
+        if found.is_none() {
+            sqlx::raw_sql(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}")).execute(db).await?;
+        }
+    }
+    Ok(())
 }
 
 pub struct PendingCall {
@@ -70,6 +93,7 @@ impl AppState {
             .busy_timeout(Duration::from_secs(5));
         let db = SqlitePoolOptions::new().max_connections(8).connect_with(options).await?;
         sqlx::raw_sql(include_str!("../schema.sql")).execute(&db).await?;
+        migrate(&db).await?;
         Ok(AppState {
             db,
             config: Arc::new(config),

@@ -1,9 +1,13 @@
+-- Tables are created here. Columns added to an existing table also need an entry
+-- in `migrate` (state.rs) for databases created before them.
+
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT NOT NULL UNIQUE,
     display_name  TEXT NOT NULL,
     password_hash TEXT NOT NULL,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    avatar        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -42,9 +46,27 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     body            TEXT NOT NULL,
     media_id        TEXT REFERENCES media(id),
-    created_at      INTEGER NOT NULL
+    created_at      INTEGER NOT NULL,
+    -- Not a foreign key: the answer outlives the original.
+    reply_to        INTEGER,
+    deleted         INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS reactions (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji      TEXT NOT NULL,
+    PRIMARY KEY (message_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS blocks (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    blocked_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, blocked_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_media ON messages(media_id);
 CREATE INDEX IF NOT EXISTS idx_members_user ON members(user_id);
 CREATE INDEX IF NOT EXISTS idx_media_owner ON media(owner_id);
+CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id);

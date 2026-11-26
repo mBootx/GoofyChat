@@ -1,9 +1,10 @@
 # Goofy Chat
 
-Self-hosted chat for Android: open sign-up, one-to-one and group conversations,
-photo, video and audio sending, voice messages, one-to-one voice and video
-calls, and notifications without any third-party push service. The interface is
-in French.
+Self-hosted chat for Android: one-to-one and group conversations, photo, video
+and audio sending, voice messages, replies, reactions, typing indicators, read
+receipts, profile photos, one-to-one voice and video calls, and notifications
+without any third-party push service. People can block each other, leave groups,
+delete their messages and delete their account. The interface is in French.
 
 There is no end-to-end encryption: HTTPS protects traffic in transit, but the
 server administrator can read messages and files.
@@ -27,6 +28,7 @@ TURN_HOST=chat.example.org
 TURN_SECRET=<long random string>
 PUBLIC_IP=<public IPv4 address>
 LAN_IP=<LAN address of the server>
+INVITE_CODE=<optional: required to sign up; leave empty for open sign-up>
 ```
 
 Then run `docker compose up -d --build` in `deploy/`. The server tests run
@@ -45,9 +47,26 @@ Run `sh build/build-apk.sh` on a Linux machine with Docker. The result is
 The signing key is created on the first build in `~/goofychat-keys`. Back it up:
 Android only installs an update signed with the same key.
 
+## Releasing an update
+
+The app looks at the latest release of `mBootx/GoofyChat` when opened (at most
+every six hours) and offers to install it when its version is higher. The
+repository must stay public.
+
+1. Raise `version` in `app/src-tauri/tauri.conf.json`, for example to `0.3.0`.
+2. Build the APK.
+3. On GitHub, publish a release tagged `v0.3.0` and attach `dist/GoofyChat.apk`.
+   Drafts and pre-releases are ignored.
+
+Always sign with the same key, or Android refuses the update. Anyone who can
+publish a release can offer an update, so protect the GitHub account.
+
 ## Known limits
 
 - Calls are one-to-one only.
-- There is no way yet to block a user, leave a group or delete a message or account.
-- Android may still delay notifications on a sleeping phone. The notification
-  service does not restart by itself after a reboot.
+- Blocking stops private messages, calls and new invitations. Messages from a
+  blocked person stay visible in groups you share.
+- Messages cannot be edited, and members cannot be added to an existing group.
+- A notification already shown stays after its message is deleted.
+- Android may still delay notifications on a sleeping phone, and some
+  manufacturers block the restart after a reboot.

@@ -1,5 +1,5 @@
 use crate::{
-    api::member_ids,
+    api::{is_blocked, member_ids},
     auth::user_for_token,
     state::{AppState, PendingCall, RING_TIMEOUT},
 };
@@ -100,6 +100,9 @@ async fn run(state: AppState, mut socket: WebSocket) {
                         if !push(&mut socket, &ServerEvent::Pong).await { break }
                     }
                     Some(ClientEvent::Call { signal }) => relay(&state, &user, signal).await,
+                    Some(ClientEvent::Typing { conversation_id }) => {
+                        typing(&state, user.id, conversation_id).await
+                    }
                     _ => {}
                 }
             }
@@ -108,6 +111,23 @@ async fn run(state: AppState, mut socket: WebSocket) {
     drop(rx);
     if let Some(list) = state.sockets.lock().unwrap().get_mut(&user.id) {
         list.retain(|t| !t.is_closed());
+    }
+}
+
+async fn typing(state: &AppState, from: i64, conversation_id: i64) {
+    if !state.allow(from.to_string(), "typing", 10, Duration::from_secs(10)) {
+        return;
+    }
+    let Ok(members) = member_ids(state, conversation_id).await else {
+        return;
+    };
+    if !members.contains(&from) {
+        return;
+    }
+    for &to in members.iter().filter(|&&id| id != from) {
+        if matches!(is_blocked(state, from, to).await, Ok(false)) {
+            state.send(&[to], &ServerEvent::Typing { conversation_id, user_id: from });
+        }
     }
 }
 
@@ -127,6 +147,9 @@ async fn relay(state: &AppState, from: &User, signal: CallSignal) {
     let Some(&to) = members.iter().find(|&&id| id != from.id) else {
         return;
     };
+    if !matches!(is_blocked(state, from.id, to).await, Ok(false)) {
+        return;
+    }
     {
         let mut calls = state.calls.lock().unwrap();
         calls.retain(|_, c| c.at.elapsed() < RING_TIMEOUT);

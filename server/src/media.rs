@@ -140,7 +140,8 @@ pub async fn cleanup(state: &AppState) -> Result<()> {
         .await?;
     sqlx::query(
         "DELETE FROM media WHERE created_at < ?
-         AND id NOT IN (SELECT media_id FROM messages WHERE media_id IS NOT NULL)",
+         AND id NOT IN (SELECT media_id FROM messages WHERE media_id IS NOT NULL)
+         AND id NOT IN (SELECT avatar FROM users WHERE avatar IS NOT NULL)",
     )
     .bind(now_ms() - day)
     .execute(&state.db)
@@ -162,6 +163,29 @@ pub async fn cleanup(state: &AppState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Removes the file of an upload that nothing uses any more.
+pub async fn discard(state: &AppState, id: &str) -> Result<()> {
+    let removed = sqlx::query(
+        "DELETE FROM media WHERE id = ?1
+         AND NOT EXISTS (SELECT 1 FROM messages WHERE media_id = ?1)
+         AND NOT EXISTS (SELECT 1 FROM users WHERE avatar = ?1)",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    if removed.rows_affected() > 0 {
+        remove_file(state, id).await;
+    }
+    Ok(())
+}
+
+/// `id` must come from the database. A failure is left to the next cleanup.
+pub async fn remove_file(state: &AppState, id: &str) {
+    if let Err(e) = tokio::fs::remove_file(state.config.data_dir.join("media").join(id)).await {
+        tracing::warn!("remove media: {e}");
+    }
 }
 
 /// Serves a file with Range support so video and audio can seek.

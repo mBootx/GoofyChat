@@ -54,17 +54,41 @@ fn too_many() -> Error {
     Error(StatusCode::TOO_MANY_REQUESTS, "Trop de tentatives, réessayez plus tard.".into())
 }
 
+#[derive(sqlx::FromRow)]
+pub struct UserRow {
+    id: i64,
+    username: String,
+    display_name: String,
+    avatar: Option<String>,
+}
+
+impl From<UserRow> for User {
+    fn from(r: UserRow) -> Self {
+        User { id: r.id, username: r.username, display_name: r.display_name, avatar: r.avatar }
+    }
+}
+
 pub async fn user_for_token(state: &AppState, token: &str) -> Result<User> {
-    let row: Option<(i64, String, String)> = sqlx::query_as(
-        "SELECT u.id, u.username, u.display_name FROM sessions s
+    let row: Option<UserRow> = sqlx::query_as(
+        "SELECT u.id, u.username, u.display_name, u.avatar FROM sessions s
          JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.created_at > ?",
     )
     .bind(token_hash(token))
     .bind(now_ms() - SESSION_MS)
     .fetch_optional(&state.db)
     .await?;
-    row.map(|(id, username, display_name)| User { id, username, display_name })
-        .ok_or_else(unauthorized)
+    row.map(Into::into).ok_or_else(unauthorized)
+}
+
+pub async fn check_password(state: &AppState, password: String, hash: String) -> Result<bool> {
+    let _slot = state.hashing.acquire().await.map_err(internal)?;
+    tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&hash)
+            .map(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
+            .unwrap_or(false)
+    })
+    .await
+    .map_err(internal)
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str> {
@@ -118,6 +142,11 @@ pub async fn register(
     if !state.allow(client_ip(&headers), "register", 5, Duration::from_secs(3600)) {
         return Err(too_many());
     }
+    // Checked after the rate limit so the code cannot be guessed quickly.
+    let invite = &state.config.invite_code;
+    if !invite.is_empty() && input.invite.trim() != invite {
+        return Err(Error(StatusCode::FORBIDDEN, "Code d'invitation incorrect.".into()));
+    }
     let password = input.password;
     let _slot = state.hashing.acquire().await.map_err(internal)?;
     let hash = tokio::task::spawn_blocking(move || {
@@ -145,7 +174,7 @@ pub async fn register(
         }
         Err(e) => return Err(e.into()),
     };
-    new_session(&state, User { id, username, display_name }).await
+    new_session(&state, User { id, username, display_name, avatar: None }).await
 }
 
 pub async fn login(
@@ -163,25 +192,16 @@ pub async fn login(
         return Err(too_many());
     }
     let wrong = || Error(StatusCode::UNAUTHORIZED, "Identifiant ou mot de passe incorrect.".into());
-    let row: Option<(i64, String, String)> =
-        sqlx::query_as("SELECT id, display_name, password_hash FROM users WHERE username = ?")
+    let row: Option<(i64, String, String, Option<String>)> =
+        sqlx::query_as("SELECT id, display_name, password_hash, avatar FROM users WHERE username = ?")
             .bind(&username)
             .fetch_optional(&state.db)
             .await?;
-    let (id, display_name, hash) = row.ok_or_else(wrong)?;
-    let password = input.password;
-    let _slot = state.hashing.acquire().await.map_err(internal)?;
-    let ok = tokio::task::spawn_blocking(move || {
-        PasswordHash::new(&hash)
-            .map(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
-            .unwrap_or(false)
-    })
-    .await
-    .map_err(internal)?;
-    if !ok {
+    let (id, display_name, hash, avatar) = row.ok_or_else(wrong)?;
+    if !check_password(&state, input.password, hash).await? {
         return Err(wrong());
     }
-    new_session(&state, User { id, username, display_name }).await
+    new_session(&state, User { id, username, display_name, avatar }).await
 }
 
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {

@@ -16,6 +16,9 @@ extern "C" {
     #[wasm_bindgen(js_name = logoutNative)]
     pub fn logout_native();
 
+    #[wasm_bindgen(js_name = sendTyping)]
+    pub fn send_typing(conversation: f64);
+
     #[wasm_bindgen(js_name = scrollBottom)]
     pub fn scroll_bottom(id: &str);
     #[wasm_bindgen(js_name = pushScreen)]

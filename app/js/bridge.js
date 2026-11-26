@@ -73,6 +73,10 @@ export function disconnect() {
 
 export function logoutNative() { window.GoofyNative?.stop(); }
 
+export function sendTyping(conversation) {
+  send({ type: "typing", conversation_id: conversation });
+}
+
 document.addEventListener("visibilitychange", () => {
   if (document.hidden || !token) return;
   // A socket silent for this long is probably dead after a suspension.

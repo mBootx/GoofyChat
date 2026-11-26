@@ -45,8 +45,8 @@ pub async fn get<T: DeserializeOwned>(token: &str, path: &str) -> Result<T, Fail
     check(response).await?.json().await.map_err(offline)
 }
 
-async fn post_raw<B: Serialize>(token: &str, path: &str, body: &B) -> Result<Response, Failure> {
-    let response = auth(Request::post(&format!("{SERVER}{path}")), token)
+async fn with_body<B: Serialize>(builder: RequestBuilder, token: &str, body: &B) -> Result<Response, Failure> {
+    let response = auth(builder, token)
         .json(body)
         .map_err(offline)?
         .send()
@@ -56,12 +56,35 @@ async fn post_raw<B: Serialize>(token: &str, path: &str, body: &B) -> Result<Res
 }
 
 pub async fn post<B: Serialize, T: DeserializeOwned>(token: &str, path: &str, body: &B) -> Result<T, Failure> {
-    post_raw(token, path, body).await?.json().await.map_err(offline)
+    let builder = Request::post(&format!("{SERVER}{path}"));
+    with_body(builder, token, body).await?.json().await.map_err(offline)
 }
 
 /// For endpoints that answer with no content.
 pub async fn post_empty(token: &str, path: &str) -> Result<(), Failure> {
-    post_raw(token, path, &()).await.map(|_| ())
+    post_unit(token, path, &()).await
+}
+
+/// Sends a body to an endpoint that answers with no content.
+pub async fn post_unit<B: Serialize>(token: &str, path: &str, body: &B) -> Result<(), Failure> {
+    with_body(Request::post(&format!("{SERVER}{path}")), token, body).await.map(|_| ())
+}
+
+pub async fn put<B: Serialize, T: DeserializeOwned>(token: &str, path: &str, body: &B) -> Result<T, Failure> {
+    let builder = Request::put(&format!("{SERVER}{path}"));
+    with_body(builder, token, body).await?.json().await.map_err(offline)
+}
+
+pub async fn put_unit<B: Serialize>(token: &str, path: &str, body: &B) -> Result<(), Failure> {
+    with_body(Request::put(&format!("{SERVER}{path}")), token, body).await.map(|_| ())
+}
+
+pub async fn delete(token: &str, path: &str) -> Result<(), Failure> {
+    let response = auth(Request::delete(&format!("{SERVER}{path}")), token)
+        .send()
+        .await
+        .map_err(offline)?;
+    check(response).await.map(|_| ())
 }
 
 pub fn media_url(id: &str) -> String {
