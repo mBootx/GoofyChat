@@ -6,3 +6,5 @@ app/src-tauri/icons/
 *.jks
 *.log
 dist/
+dist-desktop/
+dist-desktop/

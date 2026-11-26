@@ -19,6 +19,64 @@ async fn save(ctx: Ctx, profile: Profile) {
     }
 }
 
+/// Start with Windows, version and updates. Only inside the desktop app.
+#[component]
+fn DesktopSettings() -> Element {
+    let mut ctx = use_context::<Ctx>();
+    let mut autostart = use_signal(|| false);
+    let mut version = use_signal(String::new);
+    let mut checking = use_signal(|| false);
+    use_hook(move || {
+        spawn(async move {
+            autostart.set(js::get_autostart().await.as_bool().unwrap_or(false));
+            version.set(js::app_version().await.as_string().unwrap_or_default());
+        });
+    });
+
+    let toggle = move |_| {
+        let wanted = !autostart();
+        spawn(async move {
+            match js::set_autostart(wanted).await {
+                Ok(_) => autostart.set(wanted),
+                Err(e) => ctx.notify(e.as_string().unwrap_or_else(|| "Réglage impossible.".into())),
+            }
+        });
+    };
+
+    let check = move |_| {
+        if checking() {
+            return;
+        }
+        checking.set(true);
+        spawn(async move {
+            let found = js::check_update().await.as_string().unwrap_or_default();
+            checking.set(false);
+            match serde_json::from_str::<crate::Update>(&found) {
+                Ok(update) => ctx.update.set(Some(update)),
+                Err(_) => ctx.notify("Goofy Chat est à jour."),
+            }
+        });
+    };
+
+    rsx! {
+        h3 { "Application" }
+        button { class: "switch-row", role: "switch", aria_checked: "{autostart}", onclick: toggle,
+            div {
+                div { "Lancer au démarrage de Windows" }
+                div { class: "hint", "Goofy Chat démarre dans la zone de notification pour recevoir vos messages." }
+            }
+            span { class: if autostart() { "switch on" } else { "switch" } }
+        }
+        div { class: "hint", "Fermer la fenêtre garde Goofy Chat actif dans la zone de notification. Pour quitter, utilisez l'icône près de l'horloge." }
+        div { class: "version-row",
+            span { class: "hint", if version().is_empty() { "Goofy Chat" } else { "Goofy Chat {version}" } }
+            button { class: "link", disabled: checking(), onclick: check,
+                if checking() { "Recherche…" } else { "Rechercher une mise à jour" }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn Settings() -> Element {
     let ctx = use_context::<Ctx>();
@@ -123,6 +181,10 @@ pub fn Settings() -> Element {
                             "Débloquer"
                         }
                     }
+                }
+
+                if ctx.desktop {
+                    DesktopSettings {}
                 }
 
                 h3 { "Compte" }

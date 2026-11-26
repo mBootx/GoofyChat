@@ -25,6 +25,13 @@ pub enum Screen {
     Chat(i64),
 }
 
+/// A newer desktop release, found by the desktop shell.
+#[derive(Clone, Deserialize, PartialEq)]
+pub struct Update {
+    pub version: String,
+    pub url: String,
+}
+
 #[derive(Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CallView {
@@ -49,6 +56,13 @@ pub struct Ctx {
     pub blocked: Signal<Vec<User>>,
     /// Who is typing in the open conversation, with the time they last did.
     pub typing: Signal<Vec<(i64, f64)>>,
+    /// The home screen shows the member directory instead of the conversations.
+    pub people_tab: Signal<bool>,
+    /// Two panes: the list on the left, the open screen on the right.
+    pub wide: Signal<bool>,
+    /// Running inside the Windows (desktop) app.
+    pub desktop: bool,
+    pub update: Signal<Option<Update>>,
 }
 
 impl Ctx {
@@ -89,6 +103,7 @@ impl Ctx {
         self.messages.set(vec![]);
         self.blocked.set(vec![]);
         self.typing.set(vec![]);
+        self.people_tab.set(false);
     }
 
     pub async fn refresh(mut self) {
@@ -126,6 +141,9 @@ impl Ctx {
     }
 
     pub fn open(mut self, screen: Screen) {
+        if *self.screen.peek() == screen {
+            return;
+        }
         if *self.screen.peek() == Screen::Home {
             js::push_screen();
         }
@@ -147,7 +165,11 @@ impl Ctx {
                 }
                 self.messages.set(list);
                 js::scroll_bottom("messages");
-                self.read(id).await;
+                if js::is_active() {
+                    self.read(id).await;
+                } else {
+                    self.refresh().await;
+                }
             }
             Err(e) => self.fail(e),
         }
@@ -217,9 +239,13 @@ impl Ctx {
                 let id = message.conversation_id;
                 let open = *self.screen.peek() == Screen::Chat(id);
                 let sender = message.sender.id;
+                if self.desktop && sender != self.my_id() {
+                    self.announce(&message);
+                }
                 self.typing.write().retain(|t| t.0 != sender);
                 self.push_message(message);
-                if open {
+                // A window in the tray or behind others has not shown the message.
+                if open && js::is_active() {
                     self.read(id).await;
                 } else {
                     self.refresh().await;
@@ -255,10 +281,33 @@ impl Ctx {
             ServerEvent::Call { .. } | ServerEvent::Pong => {}
         }
     }
+
+    /// Desktop notification; the shell skips it while the window has the focus.
+    fn announce(self, message: &Message) {
+        let group = self
+            .conversations
+            .peek()
+            .iter()
+            .find(|c| c.id == message.conversation_id && c.is_group)
+            .map(|c| c.name.clone());
+        let title = match group {
+            Some(name) => format!("{} · {name}", message.sender.display_name),
+            None => message.sender.display_name.clone(),
+        };
+        let body = ui::summary(&message.body, message.media.as_ref().map(|m| m.mime.as_str()), false);
+        js::notify_desktop(&title, &body, false);
+    }
+
+    /// The window came back to the front: the open conversation is now seen.
+    async fn activated(self) {
+        if let Screen::Chat(id) = *self.screen.peek() {
+            self.read(id).await;
+        }
+    }
 }
 
 /// A JavaScript function that forwards strings into a channel read by Rust.
-fn channel() -> (JsValue, mpsc::UnboundedReceiver<String>) {
+pub fn channel() -> (JsValue, mpsc::UnboundedReceiver<String>) {
     let (tx, rx) = mpsc::unbounded::<String>();
     let closure = Closure::<dyn FnMut(JsValue)>::new(move |value: JsValue| {
         let _ = tx.unbounded_send(value.as_string().unwrap_or_default());
@@ -276,8 +325,62 @@ fn App() -> Element {
         toast: Signal::new(String::new()),
         blocked: Signal::new(vec![]),
         typing: Signal::new(vec![]),
+        people_tab: Signal::new(false),
+        wide: Signal::new(js::is_wide()),
+        desktop: js::is_desktop(),
+        update: Signal::new(None),
     });
     let mut call = use_signal(CallView::default);
+
+    // Desktop: layout width, Escape, window focus, updates and the unread count.
+    use_hook(move || {
+        let (callback, mut changes) = channel();
+        js::on_wide(&callback);
+        let mut wide = ctx.wide;
+        spawn(async move {
+            while let Some(value) = changes.next().await {
+                wide.set(!value.is_empty());
+            }
+        });
+        let (callback, mut keys) = channel();
+        js::on_escape(&callback);
+        spawn(async move {
+            while keys.next().await.is_some() {
+                // The conversation handles its own sheets.
+                if matches!(*ctx.screen.peek(), Screen::New | Screen::Settings) {
+                    js::pop_screen();
+                }
+            }
+        });
+        if !ctx.desktop {
+            return;
+        }
+        let (callback, mut focus) = channel();
+        js::on_active(&callback);
+        spawn(async move {
+            while focus.next().await.is_some() {
+                if ctx.session.peek().is_some() {
+                    ctx.activated().await;
+                }
+            }
+        });
+        let mut update = ctx.update;
+        spawn_forever(async move {
+            loop {
+                let found = js::check_update().await.as_string().unwrap_or_default();
+                if let Ok(found) = serde_json::from_str::<Update>(&found) {
+                    update.set(Some(found));
+                }
+                gloo_timers::future::TimeoutFuture::new(6 * 3600 * 1000).await;
+            }
+        });
+    });
+    use_effect(move || {
+        let unread: i64 = ctx.conversations.read().iter().map(|c| c.unread).sum();
+        if ctx.desktop {
+            js::set_unread(unread as f64);
+        }
+    });
 
     // Back button and call state, wired once.
     use_hook(move || {
@@ -326,20 +429,106 @@ fn App() -> Element {
     let signed_in = ctx.session.read().is_some();
     let screen = ctx.screen.read().clone();
     let toast = ctx.toast.read().clone();
+    let wide = *ctx.wide.read();
+    let update = ctx.update.read().clone();
     rsx! {
-        if !signed_in {
-            screens::Auth {}
-        } else {
-            match screen {
-                Screen::Home => rsx! { screens::Home {} },
-                Screen::New => rsx! { screens::NewChat {} },
-                Screen::Settings => rsx! { settings::Settings {} },
-                Screen::Chat(id) => rsx! { chat::Chat { key: "{id}", id } },
+        div { class: if wide { "app wide" } else { "app" },
+            if !signed_in {
+                screens::Auth {}
+            } else if wide {
+                div { class: "split",
+                    aside { class: "side-pane", screens::Home {} }
+                    section { class: "main-pane",
+                        match screen {
+                            Screen::Home => rsx! { Welcome {} },
+                            Screen::New => rsx! { screens::NewChat {} },
+                            Screen::Settings => rsx! { settings::Settings {} },
+                            Screen::Chat(id) => rsx! { chat::Chat { key: "{id}", id } },
+                        }
+                    }
+                }
+            } else {
+                match screen {
+                    Screen::Home => rsx! { screens::Home {} },
+                    Screen::New => rsx! { screens::NewChat {} },
+                    Screen::Settings => rsx! { settings::Settings {} },
+                    Screen::Chat(id) => rsx! { chat::Chat { key: "{id}", id } },
+                }
+            }
+            if let Some(found) = update {
+                UpdateBanner { update: found }
+            }
+            chat::CallOverlay { call: call.read().clone(), wide }
+            if !toast.is_empty() {
+                div { class: "toast", "{toast}" }
             }
         }
-        chat::CallOverlay { call: call.read().clone() }
-        if !toast.is_empty() {
-            div { class: "toast", "{toast}" }
+    }
+}
+
+/// The right pane when no conversation is open.
+#[component]
+fn Welcome() -> Element {
+    let ctx = use_context::<Ctx>();
+    let name = ctx.session.read().as_ref().map(|s| s.user.display_name.clone()).unwrap_or_default();
+    let first = name.split_whitespace().next().unwrap_or_default().to_string();
+    rsx! {
+        div { class: "screen welcome",
+            div { class: "logo", ui::Icon { name: "chat" } }
+            h1 { "Bonjour {first} !" }
+            p { "Choisissez une discussion à gauche, ou démarrez-en une nouvelle." }
+            div { class: "welcome-actions",
+                button { class: "primary", onclick: move |_| ctx.open(Screen::New), "Nouvelle discussion" }
+                button { class: "ghost",
+                    onclick: move |_| { let mut people = ctx.people_tab; people.set(true); },
+                    "Trouver des personnes"
+                }
+            }
+            div { class: "keys",
+                span { kbd { "Entrée" } " envoyer" }
+                span { kbd { "Échap" } " fermer" }
+                span { kbd { "Ctrl" } "+" kbd { "V" } " coller une image" }
+            }
+        }
+    }
+}
+
+/// Offers a newer desktop release, then installs it and restarts.
+#[component]
+fn UpdateBanner(update: Update) -> Element {
+    let mut ctx = use_context::<Ctx>();
+    let mut busy = use_signal(|| false);
+    let url = update.url.clone();
+    let install = move |_| {
+        if busy() {
+            return;
+        }
+        busy.set(true);
+        let url = url.clone();
+        spawn(async move {
+            // On success the app closes while the installer runs.
+            if let Err(e) = js::install_update(&url).await {
+                busy.set(false);
+                let reason = e.as_string().unwrap_or_default();
+                ctx.notify(format!("Échec de la mise à jour. {reason}"));
+            }
+        });
+    };
+    rsx! {
+        div { class: "update",
+            div { class: "update-icon", ui::Icon { name: "download" } }
+            div { class: "update-text",
+                b { "Mise à jour disponible" }
+                span {
+                    if busy() { "Téléchargement de la version {update.version}…" } else { "La version {update.version} de Goofy Chat est prête." }
+                }
+            }
+            if !busy() {
+                button { class: "ghost", onclick: move |_| ctx.update.set(None), "Plus tard" }
+            }
+            button { class: "primary", disabled: busy(), onclick: install,
+                if busy() { "Installation…" } else { "Installer" }
+            }
         }
     }
 }

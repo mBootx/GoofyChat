@@ -13,6 +13,24 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 
+# Desktop only: tray, single window, start with Windows, self-update. Nothing
+# here is built for Android.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+
+# Toasts with a click handler, and microphone/camera permission for WebView2.
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"
+# Must match the versions used by wry (see Cargo.lock).
+webview2-com = "0.39"
+windows = "0.62"
+
 [profile.release]
 strip = true
 lto = true

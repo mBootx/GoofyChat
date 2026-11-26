@@ -274,6 +274,24 @@ async fn profile_photo() {
 }
 
 #[tokio::test]
+async fn directory_lists_everyone_else() {
+    let app = app().await;
+    let (alice, _) = account(&app, "alice").await;
+    let (bob, bob_id) = account(&app, "bob").await;
+    account(&app, "carole").await;
+    let (_, all) = call(&app, "GET", "/api/users", &alice, Value::Null).await;
+    let names: Vec<&str> = all.as_array().unwrap().iter().map(|u| u["username"].as_str().unwrap()).collect();
+    assert_eq!(names, ["bob", "carole"]);
+    let (_, found) = call(&app, "GET", "/api/users?q=aro", &alice, Value::Null).await;
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    assert_eq!(found[0]["username"], "carole");
+
+    call(&app, "PUT", &format!("/api/blocks/{bob_id}"), &alice, Value::Null).await;
+    let (_, all) = call(&app, "GET", "/api/users", &bob, Value::Null).await;
+    assert_eq!(all.as_array().unwrap().len(), 1, "a block hides both ways");
+}
+
+#[tokio::test]
 async fn invite_code() {
     let app = app_with_invite("sesame").await;
     let mut body = json!({"username": "alice", "display_name": "a", "password": "motdepasse"});

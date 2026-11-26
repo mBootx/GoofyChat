@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -55,8 +56,10 @@ class ChatService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Android requires this notification to keep the connection. The user can
+        // switch the channel off: the service keeps running without it.
         manager.createNotificationChannel(
-            NotificationChannel("status", "Connexion", NotificationManager.IMPORTANCE_MIN)
+            NotificationChannel("status", "Connexion en arrière-plan", NotificationManager.IMPORTANCE_MIN)
         )
         manager.createNotificationChannel(
             NotificationChannel("messages", "Messages", NotificationManager.IMPORTANCE_HIGH)
@@ -72,11 +75,21 @@ class ChatService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Tapping opens the switch that hides this notification for good.
+        val hide = PendingIntent.getActivity(
+            this, 1,
+            Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                .putExtra(Settings.EXTRA_CHANNEL_ID, "status")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE
+        )
         val status = Notification.Builder(this, "status")
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentTitle("Goofy Chat")
-            .setContentText("En attente de messages")
-            .setContentIntent(openApp())
+            .setContentText("Touchez pour masquer cette notification")
+            .setContentIntent(hide)
+            .setShowWhen(false)
             .build()
         if (intent?.hasExtra("call") == true) {
             inCall = intent.getBooleanExtra("call", false)

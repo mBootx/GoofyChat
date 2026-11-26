@@ -7,6 +7,7 @@ use crate::{
 };
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
+use futures_util::StreamExt;
 use proto::{Conversation, Media, Message, NewMessage, Quote, React, REACTIONS};
 use wasm_bindgen::JsValue;
 
@@ -208,11 +209,72 @@ pub fn Chat(id: i64) -> Element {
     // Leaving the screen while recording releases the microphone.
     use_drop(js::cancel_recording);
 
+    // Keyboard and desktop extras: Escape closes the topmost layer (and, in two
+    // panes, the conversation); dropped or pasted files are sent.
+    let listeners = use_hook(move || {
+        let (callback, mut keys) = crate::channel();
+        let escape = js::on_escape(&callback);
+        spawn(async move {
+            while keys.next().await.is_some() {
+                if viewer.peek().is_some() {
+                    viewer.set(None);
+                } else if selected.peek().is_some() {
+                    selected.set(None);
+                } else if *menu.peek() {
+                    menu.set(false);
+                } else if replying.peek().is_some() {
+                    replying.set(None);
+                } else if *ctx.wide.peek() {
+                    js::pop_screen();
+                }
+            }
+        });
+        let (callback, mut attached) = crate::channel();
+        let attach = js::on_attach(&callback);
+        spawn(async move {
+            let mut pending = 0;
+            while let Some(event) = attached.next().await {
+                if event == "start" {
+                    pending += 1;
+                    uploading.set(true);
+                    continue;
+                }
+                pending -= 1;
+                if pending <= 0 {
+                    pending = 0;
+                    uploading.set(false);
+                }
+                if let Some(media_id) = event.strip_prefix("ok:") {
+                    let reply_to = replying.peek().as_ref().map(|m| m.id);
+                    replying.set(None);
+                    let message = NewMessage { body: String::new(), media_id: Some(media_id.to_string()), reply_to };
+                    spawn_forever(async move {
+                        post_message(ctx, id, message).await;
+                    });
+                } else if let Some(reason) = event.strip_prefix("err:") {
+                    ctx.notify(reason.to_string());
+                }
+            }
+        });
+        if ctx.desktop || *ctx.wide.peek() {
+            js::focus_input("composer");
+        }
+        (escape, attach)
+    });
+    use_drop(move || {
+        js::off_listener(&listeners.0);
+        js::off_listener(&listeners.1);
+    });
+
+    let wide = *ctx.wide.read();
+    let tap = if ctx.desktop { "cliquez sur" } else { "touchez" };
     let mut last_day = String::new();
     rsx! {
-        div { class: "screen",
+        div { class: "screen chat",
             header {
-                button { class: "icon", onclick: move |_| js::pop_screen(), Icon { name: "back" } }
+                if !wide {
+                    button { class: "icon", onclick: move |_| js::pop_screen(), Icon { name: "back" } }
+                }
                 Avatar { name: title.clone(), photo, small: true }
                 h2 { "{title}" if !subtitle.is_empty() { small { "{subtitle}" } } }
                 if !group && blocked.is_none() && conversation.is_some() {
@@ -301,7 +363,7 @@ pub fn Chat(id: i64) -> Element {
                 div { class: "status", "Envoi en cours…" }
             }
             if recording() {
-                div { class: "status", "Enregistrement… touchez ■ pour envoyer." }
+                div { class: "status", "Enregistrement… {tap} ■ pour envoyer." }
             }
             if let Some(m) = replying() {
                 div { class: "replying",
@@ -322,9 +384,9 @@ pub fn Chat(id: i64) -> Element {
                     input { id: "file", class: "hidden", r#type: "file", accept: "image/*,video/*,audio/*", onchange: file_chosen }
                     button { class: "icon", disabled: uploading() || recording(), onclick: move |_| js::pick_file("file"),
                         Icon { name: "clip" } }
-                    input { class: "field", placeholder: "Message", value: "{draft}",
+                    input { id: "composer", class: "field", placeholder: "Message", value: "{draft}",
                         oninput: typed,
-                        onkeydown: move |e| if e.key() == Key::Enter { send_text() },
+                        onkeydown: move |e| if e.key() == Key::Enter && !e.is_composing() { send_text() },
                     }
                     if draft().trim().is_empty() {
                         button { class: if recording() { "icon recording" } else { "icon" }, disabled: uploading(), onclick: record,
@@ -385,7 +447,12 @@ pub fn Chat(id: i64) -> Element {
                 }
             }
             if let Some(url) = viewer() {
-                div { class: "viewer", onclick: move |_| viewer.set(None), img { src: "{url}" } }
+                div { class: "viewer", onclick: move |_| viewer.set(None),
+                    img { src: "{url}" }
+                    if ctx.desktop {
+                        button { class: "viewer-close", title: "Fermer (Échap)", Icon { name: "hangup" } }
+                    }
+                }
             }
         }
     }
@@ -473,13 +540,14 @@ fn Attachment(media: Media, on_view: EventHandler<String>) -> Element {
 }
 
 #[component]
-pub fn CallOverlay(call: CallView) -> Element {
+pub fn CallOverlay(call: CallView, #[props(default)] wide: bool) -> Element {
     let active = !call.state.is_empty() && call.state != "idle";
     let class = match (active, call.video) {
         (false, _) => "call hidden",
         (true, true) => "call",
         (true, false) => "call audio",
     };
+    let class = if wide { format!("{class} large") } else { class.to_string() };
     let status = match call.state.as_str() {
         "calling" => "Appel en cours…",
         "incoming" if call.video => "Appel vidéo entrant",
@@ -493,6 +561,9 @@ pub fn CallOverlay(call: CallView) -> Element {
             video { id: "remote-video", autoplay: true, playsinline: true }
             video { id: "local-video", autoplay: true, playsinline: true, muted: true }
             div { class: "who",
+                if wide && active && (!call.video || call.state != "connected") {
+                    Avatar { name: call.peer.clone() }
+                }
                 h2 { "{call.peer}" }
                 div { "{status}" }
             }

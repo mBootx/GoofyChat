@@ -66,28 +66,32 @@ pub async fn is_blocked(state: &AppState, a: i64, b: i64) -> Result<bool> {
 
 #[derive(Deserialize)]
 struct Search {
+    /// Empty lists everyone.
+    #[serde(default)]
     q: String,
 }
 
+/// The member directory: everyone but the user and people blocked either way,
+/// optionally filtered by part of the username or display name.
 async fn search_users(
     State(state): State<AppState>,
     Auth(user): Auth,
     Query(search): Query<Search>,
 ) -> Result<Json<Vec<User>>> {
     let q = search.q.trim().to_lowercase();
-    if q.chars().count() < 2 {
+    if q.chars().count() > 40 {
         return Ok(Json(vec![]));
     }
     let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
     let rows: Vec<UserRow> = sqlx::query_as(
         "SELECT id, username, display_name, avatar FROM users
-         WHERE id != ?1 AND username LIKE ?2 ESCAPE '\\'
+         WHERE id != ?1 AND (username LIKE ?2 ESCAPE '\\' OR display_name LIKE ?2 ESCAPE '\\')
            AND id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?1)
            AND id NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?1)
-         ORDER BY username LIMIT 20",
+         ORDER BY display_name COLLATE NOCASE, username LIMIT 500",
     )
     .bind(user.id)
-    .bind(format!("{escaped}%"))
+    .bind(format!("%{escaped}%"))
     .fetch_all(&state.db)
     .await?;
     Ok(Json(rows.into_iter().map(Into::into).collect()))

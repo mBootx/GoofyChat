@@ -12,6 +12,19 @@ let lastSeen = 0;
 
 const KEY = "goofychat.session";
 
+// ---- platform ----
+// Android injects GoofyNative; the desktop shell is Tauri without it; a plain
+// browser has neither.
+const android = !!window.GoofyNative;
+const tauri = android ? null : window.__TAURI_INTERNALS__ || null;
+document.documentElement.classList.add(android ? "android" : tauri ? "desktop" : "browser");
+
+export function isDesktop() { return !!tauri; }
+
+function invoke(command, args = {}) {
+  return tauri ? tauri.invoke(command, args) : Promise.reject("Indisponible.");
+}
+
 export function loadSession() { return localStorage.getItem(KEY) || ""; }
 export function saveSession(json) { localStorage.setItem(KEY, json); }
 export function clearSession() { localStorage.removeItem(KEY); }
@@ -102,6 +115,135 @@ export function onBack(callback) { window.addEventListener("popstate", () => cal
 
 export function pickFile(inputId) { document.getElementById(inputId)?.click(); }
 
+// ---- layout and keyboard ----
+
+const wideQuery = matchMedia("(min-width: 900px)");
+export function isWide() { return !android && wideQuery.matches; }
+export function onWide(callback) {
+  if (!android) wideQuery.addEventListener("change", () => callback(wideQuery.matches ? "1" : ""));
+}
+
+export function onEscape(callback) {
+  const handler = (e) => { if (e.key === "Escape" && !e.isComposing) callback(""); };
+  window.addEventListener("keydown", handler);
+  return () => window.removeEventListener("keydown", handler);
+}
+export function offListener(remove) { if (typeof remove === "function") remove(); }
+
+export function focusInput(id) {
+  requestAnimationFrame(() => document.getElementById(id)?.focus({ preventScroll: true }));
+}
+
+// Files dropped on the window or pasted from the clipboard (not on Android).
+export function onAttach(callback) {
+  if (android) return null;
+  const accept = (f) => /^(image|video|audio)\//.test(f.type);
+  const send = (files) => files.filter(accept).slice(0, 10).forEach((file) => {
+    callback("start");
+    upload(file, file.name || "image.png").then(
+      (id) => callback("ok:" + id),
+      (e) => callback("err:" + (typeof e === "string" ? e : "Échec de l'envoi.")),
+    );
+  });
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+  const over = (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    document.body.classList.add("dropping");
+  };
+  const leave = (e) => { if (!e.relatedTarget) document.body.classList.remove("dropping"); };
+  const drop = (e) => {
+    document.body.classList.remove("dropping");
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    send([...e.dataTransfer.files]);
+  };
+  const paste = (e) => {
+    const files = [...(e.clipboardData?.files || [])].filter(accept);
+    if (!files.length) return;
+    e.preventDefault();
+    send(files);
+  };
+  window.addEventListener("dragover", over);
+  window.addEventListener("dragleave", leave);
+  window.addEventListener("drop", drop);
+  window.addEventListener("paste", paste);
+  return () => {
+    document.body.classList.remove("dropping");
+    window.removeEventListener("dragover", over);
+    window.removeEventListener("dragleave", leave);
+    window.removeEventListener("drop", drop);
+    window.removeEventListener("paste", paste);
+  };
+}
+
+// ---- desktop shell ----
+
+// The window may be in the tray or behind other windows.
+export function isActive() { return !tauri || (document.hasFocus() && !document.hidden); }
+export function onActive(callback) { if (tauri) window.addEventListener("focus", () => callback("")); }
+
+// The shell only shows it when the window is hidden or not focused.
+export function notifyDesktop(title, body, isCall) {
+  if (tauri) invoke("notify", { title, body, call: !!isCall }).catch(() => {});
+}
+export function setUnread(count) { if (tauri) invoke("set_unread", { count }).catch(() => {}); }
+
+export async function checkUpdate() {
+  if (!tauri) return "";
+  try {
+    const found = await invoke("check_update");
+    return found ? JSON.stringify(found) : "";
+  } catch {
+    return ""; // offline or rate limited: the next check will tell
+  }
+}
+export async function installUpdate(url) {
+  try { await invoke("install_update", { url }); } catch (e) { throw String(e); }
+}
+export async function getAutostart() {
+  if (!tauri) return false;
+  try { return !!(await invoke("autostart_enabled")); } catch { return false; }
+}
+export async function setAutostart(enabled) {
+  try { await invoke("set_autostart", { enabled }); } catch (e) { throw String(e); }
+}
+export async function appVersion() {
+  if (!tauri) return "";
+  try { return String(await invoke("app_version")); } catch { return ""; }
+}
+
+// Ring tone for incoming calls on desktop, where no system ringer exists.
+let ringing = null;
+function ringer(on) {
+  if (!tauri) return;
+  if (!on) {
+    if (ringing) { clearInterval(ringing.timer); ringing.audio.close().catch(() => {}); ringing = null; }
+    return;
+  }
+  if (ringing) return;
+  try {
+    const audio = new AudioContext();
+    const beep = () => {
+      const t = audio.currentTime;
+      [[0, 784], [0.18, 988], [0.36, 784], [0.54, 988]].forEach(([at, freq]) => {
+        const osc = audio.createOscillator();
+        const gain = audio.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, t + at);
+        gain.gain.exponentialRampToValueAtTime(0.18, t + at + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + at + 0.16);
+        osc.connect(gain).connect(audio.destination);
+        osc.start(t + at);
+        osc.stop(t + at + 0.17);
+      });
+    };
+    beep();
+    ringing = { audio, timer: setInterval(beep, 2200) };
+  } catch {}
+}
+
 // ---- uploads ----
 
 async function upload(blob, name) {
@@ -189,6 +331,7 @@ let report = () => {};
 export function onCallState(callback) { report = callback; }
 
 function publish(message = "") {
+  ringer(call?.state === "incoming");
   report(JSON.stringify(call
     ? { state: call.state, video: call.video, peer: call.peer, muted: !!call.muted, cameraOff: !!call.cameraOff, message }
     : { state: "idle", video: false, peer: "", muted: false, cameraOff: false, message }));
@@ -218,7 +361,7 @@ function end(message = "") {
 async function getMedia(current) {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true },
-    video: current.video ? { facingMode: "user", width: { ideal: 640 } } : false,
+    video: current.video ? { facingMode: "user", width: { ideal: tauri ? 1280 : 640 } } : false,
   });
   // The call may have ended while the permission dialog was open.
   if (call !== current) {
@@ -348,6 +491,7 @@ async function handleSignal(from, s) {
     if (call) return signal("reject", null, { id: s.call_id, conversation: s.conversation_id, video: s.video });
     call = { id: s.call_id, conversation: s.conversation_id, video: s.video, peer: from.display_name, state: "incoming", queued: [] };
     expire(call, 45);
+    notifyDesktop(from.display_name, s.video ? "Appel vidéo entrant" : "Appel entrant", true);
     return publish();
   }
   const current = call;
