@@ -1,0 +1,418 @@
+/* Call UI (contract 0.4.0 §9). Uses motion tokens from motion.css. */
+
+/* Base / mobile / ringing overlay */
+.call {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: #111214;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  padding: 40px 20px;
+  animation: call-enter var(--dur-slower) var(--ease-out);
+}
+@keyframes call-enter {
+  from { opacity: 0; transform: scale(calc(1 - .04 * var(--move))); }
+  to { opacity: 1; transform: none; }
+}
+.call.hidden { display: none !important; }
+
+/* Always-mounted media elements when inactive or hidden behind stage tiles */
+.call video { background: #000; }
+.call .media-hidden {
+  position: absolute;
+  width: 1px !important;
+  height: 1px !important;
+  opacity: 0 !important;
+  pointer-events: none;
+}
+
+/* Mobile & portrait ringing / audio / video layout */
+.call-backdrop {
+  position: absolute;
+  inset: -40px;
+  background: radial-gradient(circle at 50% 30%, var(--accent), #111214 70%) center / cover no-repeat;
+  filter: blur(34px) saturate(1.3) brightness(.55);
+  transform: scale(1.1);
+}
+.call-backdrop[data-empty="false"] {
+  background-size: cover;
+  background-position: center;
+}
+.call.portrait::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(#0000 40%, #000a);
+  pointer-events: none;
+}
+.call.portrait .who,
+.call.portrait .buttons { z-index: 2; }
+.call.portrait .who {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7vh;
+  text-align: center;
+  text-shadow: 0 1px 6px #000;
+}
+.call .who h2 {
+  font-size: 28px;
+  max-width: 90vw;
+  overflow-wrap: anywhere;
+}
+.call-face {
+  margin-bottom: 22px;
+  border-radius: 50%;
+  transition: box-shadow var(--dur-fast) var(--ease-out);
+}
+.call-face .avatar {
+  width: 148px;
+  height: 148px;
+  font-size: 54px;
+  text-shadow: none;
+  box-shadow: 0 16px 50px #0008;
+  border: 3px solid #ffffff40;
+}
+.call-face.speaking {
+  box-shadow: 0 0 0 4px var(--ok), 0 0 28px color-mix(in srgb, var(--ok) 60%, transparent);
+}
+.call-face.ringing { animation: call-ring 1.8s var(--ease-out) infinite; }
+@keyframes call-ring {
+  0% { box-shadow: 0 0 0 0 #ffffff55; }
+  70%, 100% { box-shadow: 0 0 0 calc(34px * var(--move)) #ffffff00; }
+}
+.call-status { opacity: .85; font-size: 15px; }
+.call-timer {
+  font-variant-numeric: tabular-nums;
+  opacity: .9;
+  font-size: 17px;
+}
+.call-timer::after { content: attr(data-t); }
+
+.call.mobile-video video#remote-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.call.mobile-video video#remote-screen {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  z-index: 1;
+}
+.call.mobile-video video#local-video {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  width: 110px;
+  height: 150px;
+  object-fit: cover;
+  border-radius: 14px;
+  transform: scaleX(-1);
+  z-index: 2;
+  border: 2px solid #ffffff30;
+  box-shadow: 0 8px 24px #0008;
+}
+.call-screen-pill {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: #00000099;
+  backdrop-filter: blur(8px);
+  font-size: 12px;
+  font-weight: 600;
+}
+.call-screen-pill svg { width: 14px; height: 14px; }
+
+.call .buttons {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  gap: 20px;
+  align-items: center;
+}
+.call .buttons:has(.answer) { gap: 80px; }
+.answer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.round {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: #ffffff26;
+  color: #fff;
+  transition: background-color var(--dur-fast) var(--ease-out), transform var(--dur-instant) var(--ease-out), filter var(--dur-fast) var(--ease-out);
+}
+.round:active { transform: scale(var(--press-scale)); }
+.round.on { background: #fff; color: #111; }
+.round.accent { background: var(--accent); color: #fff; }
+.round.red { background: var(--danger); color: #fff; }
+.round.green { background: var(--ok); color: #fff; }
+.round.pulse { animation: call-answer 1.4s var(--ease-in-out) infinite; }
+@keyframes call-answer {
+  50% {
+    transform: scale(calc(1 + .08 * var(--move)));
+    box-shadow: 0 0 0 12px color-mix(in srgb, var(--ok) 30%, transparent);
+  }
+}
+
+/* ---------- Desktop (wide) connected Discord-like stage ---------- */
+
+.call.stage {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  padding: 18px 20px 22px;
+  background: #111214;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 14px;
+}
+.call.stage:fullscreen {
+  position: fixed;
+  padding: 20px 24px 24px;
+}
+
+.call-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  z-index: 2;
+}
+.call-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.call-meta h2 {
+  font-size: 16px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.call-badge {
+  font-size: 12px;
+  color: #b5bac1;
+  background: #1e1f22;
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.call-top .call-timer {
+  font-size: 13px;
+  color: #b5bac1;
+  background: #1e1f22;
+  padding: 3px 9px;
+  border-radius: 999px;
+}
+
+/* Main stage area: participant grid or focus screen share + strip */
+.call-grid {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+}
+.call-grid.two {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: center;
+  max-width: 1280px;
+  width: 100%;
+  margin: 0 auto;
+}
+.call-grid.with-screen {
+  flex-direction: column;
+  align-items: stretch;
+}
+.call-focus {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+  border: 1px solid #2b2d31;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.call-focus video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.call-strip {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  flex: none;
+}
+.call-strip .call-tile {
+  width: 220px;
+  flex: none;
+}
+
+@media (min-width: 1400px) {
+  .call-grid.with-screen {
+    flex-direction: row;
+  }
+  .call-strip {
+    flex-direction: column;
+    justify-content: center;
+    width: 240px;
+  }
+  .call-strip .call-tile {
+    width: 100%;
+  }
+}
+
+/* Participant tile (16:9, rounded 12px, speaking ring) */
+.call-tile {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #1e1f22;
+  display: grid;
+  place-items: center;
+  border: 3px solid transparent;
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out);
+}
+.call-tile.speaking {
+  border-color: var(--ok);
+  box-shadow: 0 0 0 1px var(--ok), 0 0 22px color-mix(in srgb, var(--ok) 45%, transparent);
+}
+.call-tile video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.call-tile video.mirror {
+  transform: scaleX(-1);
+}
+.call-tile-avatar {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+}
+.call-tile-avatar .avatar {
+  width: 88px;
+  height: 88px;
+  font-size: 32px;
+  box-shadow: 0 10px 30px #0006;
+}
+.call-strip .call-tile-avatar .avatar {
+  width: 56px;
+  height: 56px;
+  font-size: 22px;
+}
+.call-tile-label {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: #00000099;
+  backdrop-filter: blur(6px);
+  font-size: 13px;
+  font-weight: 600;
+  max-width: calc(100% - 20px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.call-tile-label svg { width: 14px; height: 14px; color: var(--danger); flex: none; }
+
+/* Bottom centered control bar pill */
+.call-dock {
+  display: flex;
+  justify-content: center;
+  z-index: 3;
+}
+.call-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: #1e1f22d8;
+  backdrop-filter: blur(12px);
+  border: 1px solid #ffffff14;
+  box-shadow: 0 12px 32px #0008;
+}
+.call-bar .round {
+  width: 48px;
+  height: 48px;
+  background: #2b2d31;
+}
+.call-bar .round.on {
+  background: var(--danger);
+  color: #fff;
+}
+.call-bar .round.accent {
+  background: var(--accent);
+  color: #fff;
+}
+.call-bar .round.red {
+  background: var(--danger);
+  color: #fff;
+  width: 56px;
+  border-radius: 28px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .call-bar .round:hover { filter: brightness(1.16); }
+}
+
+/* Reduced motion: switch infinite ringing/pulse to gentle opacity pulse */
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-motion="full"]) .call-face.ringing,
+  :root:not([data-motion="full"]) .round.pulse {
+    animation: call-fade-pulse 1.8s ease-in-out infinite;
+  }
+}
+:root[data-motion="reduced"] .call-face.ringing,
+:root[data-motion="reduced"] .round.pulse {
+  animation: call-fade-pulse 1.8s ease-in-out infinite;
+}
+@keyframes call-fade-pulse {
+  50% { opacity: .65; }
+}

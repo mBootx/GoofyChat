@@ -2,14 +2,14 @@
 
 use crate::{
     account,
-    auth::{self, now_ms, Auth, UserRow},
+    auth::{self, now_ms, Auth, UserRow, USER_COLS},
     error::{bad, not_found, Error, Result},
-    links, media, messages, music, photos,
+    friends, internal, links, media, messages, music, photos, profiles,
     state::AppState,
-    ws,
+    stories, ws,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     routing::{delete, get, post, put},
     Json, Router,
@@ -28,16 +28,31 @@ pub fn router(state: AppState) -> Router {
         .route("/api/register", post(auth::register))
         .route("/api/login", post(auth::login))
         .route("/api/logout", post(auth::logout))
-        .route("/api/me", get(me).put(account::update_profile))
+        .route("/api/me", get(me).put(profiles::update_profile))
         .route("/api/account/delete", post(account::delete_account))
-        .route("/api/users", get(search_users))
+        .route("/api/users", get(profiles::search_users))
+        .route("/api/users/{id}", get(profiles::profile))
+        .route("/api/users/{id}/media", get(profiles::shared_media))
+        .route("/api/friends", get(friends::list))
+        .route("/api/friends/{id}", delete(friends::remove))
+        .route("/api/friends/requests", get(friends::requests).post(friends::send_request))
+        .route("/api/friends/requests/{id}", delete(friends::cancel))
+        .route("/api/friends/requests/{id}/accept", post(friends::accept))
+        .route("/api/friends/requests/{id}/decline", post(friends::decline))
+        .route("/api/stories", get(stories::reels).post(stories::create))
+        .route("/api/stories/archive", get(stories::archive))
+        .route("/api/stories/{id}", delete(stories::delete))
+        .route("/api/stories/{id}/seen", post(stories::seen))
+        .route("/api/stories/{id}/reshare", post(stories::reshare))
+        .route("/api/stories/{id}/media", get(stories::media))
+        .route("/api/stories/{id}/poster", get(stories::poster))
         .route("/api/blocks", get(account::blocked))
         .route("/api/blocks/{id}", put(account::block).delete(account::unblock))
         .route("/api/conversations", get(list_conversations).post(create_conversation))
         .route("/api/conversations/{id}/messages", get(messages::history).post(messages::send))
         .route("/api/conversations/{id}/read", post(messages::mark_read))
         .route("/api/conversations/{id}/leave", post(leave))
-        .route("/api/messages/{id}", delete(messages::delete))
+        .route("/api/messages/{id}", put(messages::edit).delete(messages::delete))
         .route("/api/messages/{id}/reaction", put(messages::react))
         .route("/api/media", post(media::upload).layer(DefaultBodyLimit::max(upload_limit)))
         .route("/api/media/{id}", get(media::download))
@@ -58,6 +73,20 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The stories worker's API (`WORKER_BIND`, bearer `WORKER_TOKEN`). Never public.
+pub fn internal_router(state: AppState) -> Router {
+    Router::new()
+        .route("/internal/jobs/claim", post(internal::claim))
+        .route("/internal/jobs/{id}/input", get(internal::input))
+        .route(
+            "/internal/jobs/{id}/output/{slot}",
+            put(internal::output).layer(DefaultBodyLimit::max(internal::MAIN_BYTES as usize + 1024)),
+        )
+        .route("/internal/jobs/{id}/done", post(internal::done))
+        .route("/internal/jobs/{id}/fail", post(internal::fail))
+        .with_state(state)
+}
+
 async fn me(Auth(user): Auth) -> Json<User> {
     Json(user)
 }
@@ -72,39 +101,6 @@ pub async fn is_blocked(state: &AppState, a: i64, b: i64) -> Result<bool> {
     .fetch_optional(&state.db)
     .await?;
     Ok(found.is_some())
-}
-
-#[derive(Deserialize)]
-struct Search {
-    /// Empty lists everyone.
-    #[serde(default)]
-    q: String,
-}
-
-/// The member directory: everyone but the user and people blocked either way,
-/// optionally filtered by part of the username or display name.
-async fn search_users(
-    State(state): State<AppState>,
-    Auth(user): Auth,
-    Query(search): Query<Search>,
-) -> Result<Json<Vec<User>>> {
-    let q = search.q.trim().to_lowercase();
-    if q.chars().count() > 40 {
-        return Ok(Json(vec![]));
-    }
-    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-    let rows: Vec<UserRow> = sqlx::query_as(
-        "SELECT id, username, display_name, avatar FROM users
-         WHERE id != ?1 AND (username LIKE ?2 ESCAPE '\\' OR display_name LIKE ?2 ESCAPE '\\')
-           AND id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?1)
-           AND id NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?1)
-         ORDER BY display_name COLLATE NOCASE, username LIMIT 500",
-    )
-    .bind(user.id)
-    .bind(format!("%{escaped}%"))
-    .fetch_all(&state.db)
-    .await?;
-    Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
 
 pub async fn member_ids(state: &AppState, conversation: i64) -> Result<Vec<i64>> {
@@ -141,13 +137,20 @@ async fn list_conversations(
     .await?;
     let mut list = Vec::with_capacity(rows.len());
     for (id, name, is_group, created_at, unread) in rows {
-        let members: Vec<UserRow> = sqlx::query_as(
-            "SELECT u.id, u.username, u.display_name, u.avatar FROM members m
-             JOIN users u ON u.id = m.user_id WHERE m.conversation_id = ? ORDER BY u.display_name",
-        )
+        let members: Vec<UserRow> = sqlx::query_as(&format!(
+            "SELECT {USER_COLS} FROM members m
+             JOIN users u ON u.id = m.user_id WHERE m.conversation_id = ? ORDER BY u.display_name"
+        ))
         .bind(id)
         .fetch_all(&state.db)
         .await?;
+        let members: Vec<User> = members.into_iter().map(Into::into).collect();
+        // One-to-one: locked unless the two are friends (and not blocked).
+        let locked = !is_group
+            && match members.iter().find(|m| m.id != user.id) {
+                Some(other) => friends::locked_pair(&state, user.id, other.id).await?,
+                None => true,
+            };
         let reads: Vec<(i64, i64)> =
             sqlx::query_as("SELECT user_id, last_read FROM members WHERE conversation_id = ?")
                 .bind(id)
@@ -161,13 +164,14 @@ async fn list_conversations(
                 id,
                 name,
                 is_group,
-                members: members.into_iter().map(Into::into).collect(),
+                members,
                 last_message,
                 unread,
                 reads: reads
                     .into_iter()
                     .map(|(user_id, message_id)| ReadMark { user_id, message_id })
                     .collect(),
+                locked,
             },
         ));
     }
@@ -206,6 +210,16 @@ async fn create_conversation(
     let is_group = !name.is_empty() || others.len() > 1;
     if is_group && name.is_empty() {
         return Err(bad("Donnez un nom au groupe."));
+    }
+    for &id in &others {
+        if !friends::are_friends(&state, user.id, id).await? {
+            let message = if is_group {
+                "Vous ne pouvez ajouter que vos amis."
+            } else {
+                "Vous devez être amis pour discuter."
+            };
+            return Err(Error(StatusCode::FORBIDDEN, message.into()));
+        }
     }
     let direct_key = (!is_group).then(|| {
         let (a, b) = (user.id.min(others[0]), user.id.max(others[0]));

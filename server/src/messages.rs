@@ -4,7 +4,7 @@ use crate::{
     api::{is_blocked, require_member},
     auth::{now_ms, Auth},
     error::{bad, not_found, Error, Result},
-    media, music,
+    friends, media, mentions, music,
     state::AppState,
 };
 use axum::{
@@ -27,6 +27,10 @@ struct MessageRow {
     username: String,
     display_name: String,
     avatar: Option<String>,
+    avatar_still: Option<String>,
+    name_font: String,
+    name_color: String,
+    edited_at: Option<i64>,
     media_id: Option<String>,
     mime: Option<String>,
     name: Option<String>,
@@ -82,6 +86,9 @@ impl From<MessageRow> for Message {
                 username: r.username,
                 display_name: r.display_name,
                 avatar: r.avatar,
+                avatar_still: r.avatar_still,
+                name_font: r.name_font,
+                name_color: r.name_color,
             },
             body: r.body,
             media,
@@ -90,12 +97,14 @@ impl From<MessageRow> for Message {
             reactions: vec![],
             deleted: r.deleted,
             track: None,
+            edited_at: r.edited_at,
+            mentions: vec![],
         }
     }
 }
 
-const SELECT: &str = "SELECT m.id, m.conversation_id, m.body, m.created_at, m.deleted,
-    u.id AS sender_id, u.username, u.display_name, u.avatar,
+const SELECT: &str = "SELECT m.id, m.conversation_id, m.body, m.created_at, m.deleted, m.edited_at,
+    u.id AS sender_id, u.username, u.display_name, u.avatar, u.avatar_still, u.name_font, u.name_color,
     f.id AS media_id, f.mime, f.name, f.size,
     m.reply_to, ru.display_name AS reply_sender, r.body AS reply_body,
     rf.mime AS reply_mime, r.deleted AS reply_deleted,
@@ -123,8 +132,21 @@ async fn with_reactions(state: &AppState, rows: Vec<MessageRow>) -> Result<Vec<M
     for (message, user_id, emoji) in query.fetch_all(&state.db).await? {
         found.entry(message).or_default().push(Reaction { user_id, emoji });
     }
+    // Mentions, in the order they were stored (order of appearance).
+    let sql = format!(
+        "SELECT message_id, user_id FROM message_mentions WHERE message_id IN ({marks}) ORDER BY rowid"
+    );
+    let mut query = sqlx::query_as::<_, (i64, i64)>(&sql);
+    for message in &messages {
+        query = query.bind(message.id);
+    }
+    let mut mentions: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (message, user_id) in query.fetch_all(&state.db).await? {
+        mentions.entry(message).or_default().push(user_id);
+    }
     for message in &mut messages {
         message.reactions = found.remove(&message.id).unwrap_or_default();
+        message.mentions = mentions.remove(&message.id).unwrap_or_default();
     }
     Ok(messages)
 }
@@ -137,9 +159,30 @@ async fn by_id(state: &AppState, id: i64) -> Result<Message> {
 
 pub async fn last(state: &AppState, conversation: i64) -> Result<Option<Message>> {
     let sql = format!("{SELECT} WHERE m.conversation_id = ? ORDER BY m.id DESC LIMIT 1");
-    let row: Option<MessageRow> =
-        sqlx::query_as(&sql).bind(conversation).fetch_optional(&state.db).await?;
-    Ok(row.map(|r| message_of(state, r)))
+    let rows: Vec<MessageRow> = sqlx::query_as(&sql).bind(conversation).fetch_all(&state.db).await?;
+    Ok(with_reactions(state, rows).await?.pop())
+}
+
+/// Replaces the stored mentions of a message by those found in its body.
+async fn store_mentions(state: &AppState, message: i64, conversation: i64, sender: i64, body: &str) -> Result<()> {
+    let members: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT u.id, u.username FROM members m JOIN users u ON u.id = m.user_id WHERE m.conversation_id = ?",
+    )
+    .bind(conversation)
+    .fetch_all(&state.db)
+    .await?;
+    let ids = mentions::resolve(body, &members, sender);
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM message_mentions WHERE message_id = ?").bind(message).execute(&mut *tx).await?;
+    for id in ids {
+        sqlx::query("INSERT OR IGNORE INTO message_mentions (message_id, user_id) VALUES (?, ?)")
+            .bind(message)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -168,7 +211,8 @@ fn slow_down() -> Error {
     Error(StatusCode::TOO_MANY_REQUESTS, "Doucement ! Patientez un instant.".into())
 }
 
-/// Refuses to write in a one-to-one conversation where either side blocked the other.
+/// Refuses to write in a locked one-to-one conversation: blocked either way (block
+/// message), or no longer friends.
 async fn require_open(state: &AppState, conversation: i64, members: &[i64], user: i64) -> Result<()> {
     let (is_group,): (bool,) = sqlx::query_as("SELECT is_group FROM conversations WHERE id = ?")
         .bind(conversation)
@@ -178,6 +222,12 @@ async fn require_open(state: &AppState, conversation: i64, members: &[i64], user
         for &other in members.iter().filter(|&&m| m != user) {
             if is_blocked(state, user, other).await? {
                 return Err(Error(StatusCode::FORBIDDEN, "Vous ne pouvez pas écrire à cette personne.".into()));
+            }
+            if !friends::are_friends(state, user, other).await? {
+                return Err(Error(
+                    StatusCode::FORBIDDEN,
+                    "Vous n'êtes plus amis. Envoyez une demande d'ami pour reprendre la discussion.".into(),
+                ));
             }
         }
     }
@@ -247,8 +297,56 @@ pub async fn send(
     .execute(&state.db)
     .await?
     .last_insert_rowid();
+    if body.contains('@') {
+        store_mentions(&state, message_id, id, user.id, &body).await?;
+    }
     let message = by_id(&state, message_id).await?;
     state.send(&members, &ServerEvent::Message { message: message.clone() });
+    Ok(Json(message))
+}
+
+/// Changes the text of one of the caller's messages. Edits never notify.
+pub async fn edit(
+    State(state): State<AppState>,
+    Auth(user): Auth,
+    Path(id): Path<i64>,
+    Json(input): Json<EditMessage>,
+) -> Result<Json<Message>> {
+    let (conversation, sender, members) = visible(&state, id, user.id).await?;
+    if sender != user.id {
+        return Err(Error(StatusCode::FORBIDDEN, "Vous ne pouvez modifier que vos messages.".into()));
+    }
+    require_open(&state, conversation, &members, user.id).await?;
+    let (old, media_id, track_id): (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT body, media_id, track_id FROM messages WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await?;
+    if track_id.is_some() {
+        return Err(bad("Ce message ne peut pas être modifié."));
+    }
+    let body = input.body.trim().to_string();
+    if body.chars().count() > 4000 {
+        return Err(bad("Message trop long."));
+    }
+    if body.is_empty() && media_id.is_none() {
+        return Err(bad("Message vide."));
+    }
+    if body == old {
+        return Ok(Json(by_id(&state, id).await?));
+    }
+    if !state.allow(user.id.to_string(), "edit", 30, Duration::from_secs(60)) {
+        return Err(slow_down());
+    }
+    sqlx::query("UPDATE messages SET body = ?, edited_at = ? WHERE id = ?")
+        .bind(&body)
+        .bind(now_ms())
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    store_mentions(&state, id, conversation, user.id, &body).await?;
+    let message = by_id(&state, id).await?;
+    state.send(&members, &ServerEvent::Update { message: message.clone() });
     Ok(Json(message))
 }
 
@@ -287,6 +385,7 @@ pub async fn delete(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM reactions WHERE message_id = ?").bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM message_mentions WHERE message_id = ?").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     if let Some(media_id) = media_id {
         media::discard(&state, &media_id).await?;

@@ -10,6 +10,9 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.net.Uri
 import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import androidx.activity.OnBackPressedCallback
 import androidx.core.view.ViewCompat
@@ -103,6 +106,27 @@ class MainActivity : TauriActivity() {
                 .putExtra("call", active)
                 .putExtra("video", video)
             runOnUiThread { startForegroundService(intent) }
+        }
+
+        /** Short haptic feedback (long press on a message, start of a camera video). */
+        @JavascriptInterface
+        fun vibrate(ms: Long) {
+            val duration = ms.coerceIn(1L, 500L)
+            runCatching {
+                val vibrator = if (Build.VERSION.SDK_INT >= 31) {
+                    getSystemService(VibratorManager::class.java)?.defaultVibrator
+                } else {
+                    @Suppress("DEPRECATION")
+                    getSystemService(Vibrator::class.java)
+                }
+                if (vibrator == null || !vibrator.hasVibrator()) return@runCatching
+                if (Build.VERSION.SDK_INT >= 26) {
+                    vibrator.vibrate(VibrationEffect.createOneShot(duration, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator.vibrate(duration)
+                }
+            }
         }
 
         @JavascriptInterface

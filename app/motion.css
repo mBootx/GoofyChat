@@ -1,0 +1,22 @@
+/* Motion tokens (contract 0.4.0, section 8.4). Every transition and animation uses these
+   tokens, never raw durations. Translations are written calc(<distance> * var(--move)). */
+:root {
+  --dur-instant: 90ms;   /* press feedback, toggles */
+  --dur-fast: 160ms;     /* hover, fades, leaving menus */
+  --dur-base: 240ms;     /* menus, popovers, long-press menu */
+  --dur-slow: 340ms;     /* sheets, page changes */
+  --dur-slower: 480ms;   /* story viewer, call screen */
+  --dur-fade: 140ms;     /* pure opacity changes; kept when motion is reduced */
+  --ease-out: cubic-bezier(.22, 1, .36, 1);       /* entering */
+  --ease-in: cubic-bezier(.55, 0, 1, .45);        /* leaving */
+  --ease-in-out: cubic-bezier(.65, 0, .35, 1);    /* moving across the screen */
+  --ease-spring: cubic-bezier(.34, 1.56, .64, 1); /* overshoot: heart, reactions, pops */
+  --move: 1;             /* multiply translate distances by this */
+  --press-scale: .96;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-motion="full"]) { --dur-instant: 1ms; --dur-fast: 1ms; --dur-base: 1ms;
+    --dur-slow: 1ms; --dur-slower: 1ms; --move: 0; --press-scale: 1; }
+}
+:root[data-motion="reduced"] { --dur-instant: 1ms; --dur-fast: 1ms; --dur-base: 1ms;
+  --dur-slow: 1ms; --dur-slower: 1ms; --move: 0; --press-scale: 1; }

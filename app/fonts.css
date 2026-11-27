@@ -1,0 +1,37 @@
+/* Bundled fonts (package F1). SIL Open Font License 1.1, see fonts/LICENSES.txt.
+   One @font-face per file in fonts/ (latin subset, copied by trunk); the browser fetches a
+   file only when a rendered element uses it. The .font-<id> classes are used by ui::Name
+   (profile fonts); html[data-font] (look.css) applies one of them to message text.
+   The latin subset covers French, including the oe ligature. */
+@font-face { font-family: "GC Inter"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/inter-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Inter"; font-style: normal; font-weight: 700; font-display: swap; src: url("fonts/inter-700.woff2") format("woff2"); }
+@font-face { font-family: "GC Nunito"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/nunito-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Nunito"; font-style: normal; font-weight: 700; font-display: swap; src: url("fonts/nunito-700.woff2") format("woff2"); }
+@font-face { font-family: "GC Atkinson Hyperlegible"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/atkinson-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Atkinson Hyperlegible"; font-style: normal; font-weight: 700; font-display: swap; src: url("fonts/atkinson-700.woff2") format("woff2"); }
+@font-face { font-family: "GC Lora"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/lora-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Lora"; font-style: normal; font-weight: 700; font-display: swap; src: url("fonts/lora-700.woff2") format("woff2"); }
+@font-face { font-family: "GC Space Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/space-mono-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Space Mono"; font-style: normal; font-weight: 700; font-display: swap; src: url("fonts/space-mono-700.woff2") format("woff2"); }
+@font-face { font-family: "GC Comfortaa"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/comfortaa-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Comfortaa"; font-style: normal; font-weight: 700; font-display: swap; src: url("fonts/comfortaa-700.woff2") format("woff2"); }
+@font-face { font-family: "GC Caveat"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/caveat-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Caveat"; font-style: normal; font-weight: 700; font-display: swap; src: url("fonts/caveat-700.woff2") format("woff2"); }
+@font-face { font-family: "GC Pacifico"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/pacifico-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Press Start 2P"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/press-start-400.woff2") format("woff2"); }
+@font-face { font-family: "GC Bebas Neue"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/bebas-400.woff2") format("woff2"); }
+
+.font-inter { font-family: "GC Inter", system-ui, sans-serif; }
+.font-nunito { font-family: "GC Nunito", system-ui, sans-serif; }
+.font-atkinson { font-family: "GC Atkinson Hyperlegible", system-ui, sans-serif; }
+.font-lora { font-family: "GC Lora", system-ui, serif; }
+.font-space-mono { font-family: "GC Space Mono", system-ui, monospace; }
+.font-comfortaa { font-family: "GC Comfortaa", system-ui, sans-serif; }
+.font-caveat { font-family: "GC Caveat", system-ui, cursive; }
+.font-pacifico { font-family: "GC Pacifico", system-ui, cursive; }
+.font-press-start { font-family: "GC Press Start 2P", system-ui, monospace; }
+.font-bebas { font-family: "GC Bebas Neue", system-ui, sans-serif; }
+
+/* Optical corrections: these two faces run small / wide for their size. */
+.font-press-start { font-size: .72em; }
+.font-bebas { font-size: 1.15em; letter-spacing: .02em; }

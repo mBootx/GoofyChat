@@ -1,7 +1,7 @@
 //! "Envoyer depuis mes photos": the attach menu of the composer and a picker for the
 //! photos and videos SelfHost-hub backed up to FileBrowser.
 
-use crate::{api, chat, js, links::LinkNeeded, music, ui::Icon, Ctx};
+use crate::{api, chat, js, links::LinkNeeded, music, ui::Icon, Ctx, Overlay};
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use proto::{ImportPhoto, Media, Message, NewMessage, Photo};
@@ -25,7 +25,7 @@ pub fn ComposerPanel(id: i64, panel: Signal<Option<Panel>>, replying: Signal<Opt
     let reply_to = replying.read().as_ref().map(|m| m.id);
     match panel() {
         None => rsx! {},
-        Some(Panel::Attach) => rsx! { AttachMenu { panel } },
+        Some(Panel::Attach) => rsx! { AttachMenu { id, panel } },
         Some(Panel::Photos) => rsx! { PhotoPicker { id, panel, replying } },
         Some(Panel::Music) => rsx! {
             music::MusicSheet { id, reply_to,
@@ -40,15 +40,37 @@ pub fn ComposerPanel(id: i64, panel: Signal<Option<Panel>>, replying: Signal<Opt
     }
 }
 
-/// The clip button: a file of the device, or a backed-up photo.
+/// The clip button: the camera, a file of the device, or a backed-up photo.
 #[component]
-fn AttachMenu(panel: Signal<Option<Panel>>) -> Element {
+fn AttachMenu(id: i64, panel: Signal<Option<Panel>>) -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut camera = use_signal(|| false);
+    use_hook(move || {
+        spawn(async move {
+            let found = crate::camera::camera_available().await.as_bool().unwrap_or(false);
+            camera.set(found);
+        })
+    });
     rsx! {
         div { class: "backdrop", onclick: move |_| panel.set(None),
             div { class: "sheet attach-sheet", onclick: move |e| e.stop_propagation(),
                 div { class: "sheet-head",
                     div { class: "sheet-title", b { "Joindre" } }
                     button { class: "icon", title: "Fermer", onclick: move |_| panel.set(None), Icon { name: "hangup" } }
+                }
+                if camera() {
+                    button { class: "attach-option",
+                        onclick: move |_| {
+                            panel.set(None);
+                            ctx.open_overlay(Overlay::Camera { conversation_id: id });
+                        },
+                        div { class: "attach-icon camera", Icon { name: "camera" } }
+                        div { class: "attach-text",
+                            b { "Caméra" }
+                            span { "Touchez pour une photo, maintenez pour une vidéo" }
+                        }
+                        Icon { name: "chevron" }
+                    }
                 }
                 button { class: "attach-option",
                     onclick: move |_| {

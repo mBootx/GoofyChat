@@ -1,15 +1,42 @@
-//! The conversation view and the call overlay.
+//! The conversation view (package C, contract 0.4.0 §7.6).
+//! Bubbles and the long-press menu live in `chat/bubble.rs`, the input bar in
+//! `chat/composer.rs`.
+
+mod bubble;
+mod composer;
 
 use crate::{
-    api, js, screens,
-    ui::{self, Avatar, Icon},
-    CallView, Ctx,
+    api, js,
+    photos::Panel,
+    screens,
+    ui::{self, Avatar, Icon, Name, UserAvatar},
+    Ctx, Screen,
 };
+use bubble::{Bubble, MenuAction, MessageMenu};
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-use proto::{Conversation, Media, Message, NewMessage, Quote, React, REACTIONS};
-use wasm_bindgen::JsValue;
+use proto::{Conversation, Message, NewMessage, LIKE};
+use wasm_bindgen::prelude::*;
+
+/// Bindings of `js/gestures.js`.
+#[wasm_bindgen(module = "/js/gestures.js")]
+extern "C" {
+    /// Long press / right click, double tap and photo taps on `[data-msg]` elements inside
+    /// the container. Returns a handle for `js::off_listener`.
+    #[wasm_bindgen(js_name = attachGestures)]
+    fn attach_gestures(container_id: &str, callback: &JsValue) -> JsValue;
+    /// Grows the composer up to 5 lines.
+    #[wasm_bindgen(js_name = autosize)]
+    fn autosize(textarea_id: &str);
+    /// Enter sends (real keyboard) rather than inserting a new line.
+    #[wasm_bindgen(js_name = enterSends)]
+    fn enter_sends() -> bool;
+    #[wasm_bindgen(js_name = placeMenu)]
+    fn place_menu(menu_id: &str, x: f64, y: f64);
+    #[wasm_bindgen(catch, js_name = copyText)]
+    async fn copy_text(text: &str) -> Result<JsValue, JsValue>;
+}
 
 pub(crate) async fn post_message(ctx: Ctx, id: i64, message: NewMessage) -> bool {
     let path = format!("/api/conversations/{id}/messages");
@@ -25,61 +52,66 @@ pub(crate) async fn post_message(ctx: Ctx, id: i64, message: NewMessage) -> bool
     }
 }
 
-/// Sends the file produced by an upload or a recording.
-async fn send_media(ctx: Ctx, id: i64, reply_to: Option<i64>, uploaded: Result<JsValue, JsValue>) {
-    match uploaded {
-        Ok(value) => {
-            if let Some(media_id) = value.as_string().filter(|s| !s.is_empty()) {
-                let message = NewMessage { body: String::new(), media_id: Some(media_id), reply_to, track_id: None };
-                post_message(ctx, id, message).await;
-            }
-        }
-        Err(e) => ctx.notify(e.as_string().unwrap_or_else(|| "Échec de l'envoi.".into())),
-    }
-}
-
-/// Adds the reaction, or removes it when it is already the user's.
-fn toggle_reaction(ctx: Ctx, message: &Message, emoji: String) {
-    let me = ctx.my_id();
-    let same = message.reactions.iter().any(|r| r.user_id == me && r.emoji == emoji);
-    let body = React { emoji: (!same).then_some(emoji) };
-    let path = format!("/api/messages/{}/reaction", message.id);
-    spawn_forever(async move {
-        if let Err(e) = api::put_unit(&ctx.token(), &path, &body).await {
-            ctx.fail(e);
-        }
-    });
-}
-
-/// Delivery state of one of the user's own messages.
-fn receipt(conversation: &Conversation, me: i64, message: i64) -> String {
-    let others = conversation.members.iter().filter(|u| u.id != me);
-    let total = others.clone().count();
-    let read = others
-        .filter(|u| conversation.reads.iter().any(|r| r.user_id == u.id && r.message_id >= message))
-        .count();
-    match read {
-        0 => "✓".into(),
-        n if n == total => "✓✓".into(),
-        n => format!("✓ Lu par {n}"),
-    }
-}
-
-/// Reactions grouped by emoji, with their count and whether the user is in them.
-fn tally(message: &Message, me: i64) -> Vec<(&'static str, usize, bool)> {
-    REACTIONS
+/// Desktop notification for a message; the shell skips it while the window has the focus.
+/// A message mentioning the user is announced even then (as a toast inside the window),
+/// unless its conversation is open and active.
+pub fn announce(ctx: Ctx, message: &Message) {
+    let group = ctx
+        .conversations
+        .peek()
         .iter()
-        .filter_map(|&emoji| {
-            let given = message.reactions.iter().filter(|r| r.emoji == emoji);
-            let count = given.clone().count();
-            let mine = given.clone().any(|r| r.user_id == me);
-            (count > 0).then_some((emoji, count, mine))
-        })
-        .collect()
+        .find(|c| c.id == message.conversation_id && c.is_group)
+        .map(|c| c.name.clone());
+    let body = ui::message_summary(message);
+    if message.mentions.contains(&ctx.my_id()) {
+        let open = *ctx.screen.peek() == Screen::Chat(message.conversation_id);
+        if open && js::is_active() {
+            return;
+        }
+        let mut title = format!("{} vous a mentionné", message.sender.display_name);
+        if let Some(name) = group {
+            title.push_str(&format!(" · {name}"));
+        }
+        if js::is_active() {
+            ctx.notify(format!("{title} : {body}"));
+        } else {
+            js::notify_desktop(&title, &body, false);
+        }
+        return;
+    }
+    let title = match group {
+        Some(name) => format!("{} · {name}", message.sender.display_name),
+        None => message.sender.display_name.clone(),
+    };
+    js::notify_desktop(&title, &body, false);
 }
 
-fn quoted(quote: &Quote) -> String {
-    ui::summary(&quote.body, quote.mime.as_deref(), quote.deleted)
+/// "Vu" / "Envoyé" / "Vu par n" line of a conversation row, shown instead of the time.
+/// None: show the time (last message not mine, deleted, or a locked conversation).
+pub fn row_status(conversation: &Conversation, me: i64) -> Option<String> {
+    if conversation.locked {
+        return None;
+    }
+    let last = conversation.last_message.as_ref().filter(|m| m.sender.id == me && !m.deleted)?;
+    let seen = conversation
+        .members
+        .iter()
+        .filter(|u| u.id != me)
+        .filter(|u| conversation.reads.iter().any(|r| r.user_id == u.id && r.message_id >= last.id))
+        .count();
+    if conversation.is_group {
+        (seen >= 1).then(|| format!("Vu par {seen}"))
+    } else {
+        Some(if seen >= 1 { "Vu" } else { "Envoyé" }.to_string())
+    }
+}
+
+/// Where the long-press menu is open: message id and press point.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Pressed {
+    id: i64,
+    x: f64,
+    y: f64,
 }
 
 #[component]
@@ -87,22 +119,28 @@ pub fn Chat(id: i64) -> Element {
     let mut ctx = use_context::<Ctx>();
     let me = ctx.my_id();
     let mut draft = use_signal(String::new);
-    let mut recording = use_signal(|| false);
-    let mut uploading = use_signal(|| false);
+    let recording = use_signal(|| false);
+    let uploading = use_signal(|| false);
     let mut viewer = use_signal(|| None::<String>);
     let mut exhausted = use_signal(|| false);
     let mut replying = use_signal(|| None::<Message>);
-    let mut selected = use_signal(|| None::<i64>);
-    let mut confirm_delete = use_signal(|| false);
+    let mut editing = use_signal(|| None::<Message>);
+    let mut pressed = use_signal(|| None::<Pressed>);
+    // Double-tap heart: message id and a counter that replays the animation.
+    let mut heart = use_signal(|| None::<(i64, u32)>);
     let mut menu = use_signal(|| false);
-    let mut last_typing = use_signal(|| 0.0);
     // Attach menu, photo picker or music sheet.
-    let mut panel = use_signal(|| None::<crate::photos::Panel>);
+    let mut panel = use_signal(|| None::<Panel>);
 
     let conversation = ctx.conversations.read().iter().find(|c| c.id == id).cloned();
     let title = conversation.as_ref().map(|c| screens::title(c, me)).unwrap_or_default();
-    let photo = conversation.as_ref().and_then(|c| screens::photo(c, me));
     let group = conversation.as_ref().is_some_and(|c| c.is_group);
+    let locked = conversation.as_ref().is_some_and(|c| c.locked);
+    // The other person of a one-to-one conversation.
+    let peer = conversation
+        .as_ref()
+        .filter(|c| !c.is_group)
+        .and_then(|c| c.members.iter().find(|u| u.id != me).cloned());
     let subtitle = conversation
         .as_ref()
         .filter(|c| c.is_group)
@@ -113,45 +151,37 @@ pub fn Chat(id: i64) -> Element {
         })
         .unwrap_or_default();
     // The other person, when this user blocked them.
-    let blocked = conversation
-        .as_ref()
-        .filter(|c| !c.is_group)
-        .and_then(|c| c.members.iter().find(|u| u.id != me))
-        .filter(|u| ctx.blocked.read().iter().any(|b| b.id == u.id))
-        .map(|u| u.id);
-    let typing = {
+    let blocked = peer.as_ref().filter(|u| ctx.blocked.read().iter().any(|b| b.id == u.id)).map(|u| u.id);
+    // Usernames for mention highlighting; other members for "@" suggestions (groups).
+    let members: Vec<(String, i64)> = conversation
+        .iter()
+        .flat_map(|c| c.members.iter())
+        .map(|u| (u.username.clone(), u.id))
+        .collect();
+    let suggest: Vec<proto::User> = conversation
+        .iter()
+        .filter(|c| c.is_group)
+        .flat_map(|c| c.members.iter())
+        .filter(|u| u.id != me)
+        .cloned()
+        .collect();
+    let (typing, typing_names) = {
         let who = ctx.typing.read();
         let names: Vec<String> = conversation
             .iter()
             .flat_map(|c| c.members.iter())
-            .filter(|u| who.iter().any(|t| t.0 == u.id))
+            .filter(|u| u.id != me && who.iter().any(|t| t.0 == u.id))
             .map(|u| u.display_name.clone())
             .collect();
-        match names.len() {
+        let label = match names.len() {
             0 => String::new(),
             1 => format!("{} écrit…", names[0]),
             _ => format!("{} écrivent…", names.join(", ")),
-        }
+        };
+        (!names.is_empty(), label)
     };
     let messages = ctx.messages.read().clone();
-    let chosen = selected().and_then(|s| messages.iter().find(|m| m.id == s && !m.deleted).cloned());
-
-    let mut send_text = move || {
-        let body = draft().trim().to_string();
-        if body.is_empty() {
-            return;
-        }
-        let quoted = replying();
-        draft.set(String::new());
-        replying.set(None);
-        spawn(async move {
-            let message = NewMessage { body: body.clone(), media_id: None, reply_to: quoted.as_ref().map(|m| m.id), track_id: None };
-            if !post_message(ctx, id, message).await {
-                draft.set(body);
-                replying.set(quoted);
-            }
-        });
-    };
+    let menu_for = pressed().and_then(|p| messages.iter().find(|m| m.id == p.id && !m.deleted).cloned().map(|m| (m, p)));
 
     let older = move |_| {
         let Some(first) = ctx.messages.peek().first().map(|m| m.id) else { return };
@@ -168,68 +198,53 @@ pub fn Chat(id: i64) -> Element {
         });
     };
 
-    let file_chosen = move |_| {
-        uploading.set(true);
-        let reply_to = replying().map(|m| m.id);
-        replying.set(None);
-        // Keeps going if the user leaves the conversation.
-        spawn_forever(async move {
-            send_media(ctx, id, reply_to, js::upload_from_input("file").await).await;
-            if let Ok(mut busy) = uploading.try_write() {
-                *busy = false;
+    let act = move |action: MenuAction| {
+        pressed.set(None);
+        match action {
+            MenuAction::Reply(m) => {
+                editing.set(None);
+                replying.set(Some(m));
             }
-        });
-    };
-
-    let record = move |_| {
-        if recording() {
-            recording.set(false);
-            uploading.set(true);
-            let reply_to = replying().map(|m| m.id);
-            replying.set(None);
-            spawn_forever(async move {
-                send_media(ctx, id, reply_to, js::stop_recording().await).await;
-                if let Ok(mut busy) = uploading.try_write() {
-                    *busy = false;
+            MenuAction::Mention(m) => {
+                editing.set(None);
+                let prefix = format!("@{} ", m.sender.username);
+                let current = draft.peek().clone();
+                if !current.starts_with(&prefix) {
+                    draft.set(format!("{prefix}{current}"));
                 }
-            });
-        } else {
-            spawn(async move {
-                match js::start_recording().await {
-                    Ok(started) => recording.set(started.as_bool().unwrap_or(false)),
-                    Err(e) => ctx.notify(e.as_string().unwrap_or_default()),
-                }
-            });
+                replying.set(Some(m));
+            }
+            MenuAction::Edit(m) => {
+                replying.set(None);
+                draft.set(m.body.clone());
+                editing.set(Some(m));
+            }
         }
+        js::focus_input("composer");
     };
-
-    let typed = move |e: FormEvent| {
-        draft.set(e.value());
-        let now = js_sys::Date::now();
-        if !e.value().is_empty() && now - last_typing() > 3000.0 {
-            last_typing.set(now);
-            js::send_typing(id as f64);
-        }
-    };
-
-    // Leaving the screen while recording releases the microphone.
-    use_drop(js::cancel_recording);
 
     // Keyboard and desktop extras: Escape closes the topmost layer (and, in two
-    // panes, the conversation); dropped or pasted files are sent.
+    // panes, the conversation); dropped or pasted files are sent; message gestures.
     let listeners = use_hook(move || {
         let (callback, mut keys) = crate::channel();
         let escape = js::on_escape(&callback);
         spawn(async move {
             while keys.next().await.is_some() {
+                // An overlay (camera) is closed by the App first.
+                if ctx.overlay.peek().is_some() {
+                    continue;
+                }
                 if viewer.peek().is_some() {
                     viewer.set(None);
-                } else if selected.peek().is_some() {
-                    selected.set(None);
+                } else if pressed.peek().is_some() {
+                    pressed.set(None);
                 } else if *menu.peek() {
                     menu.set(false);
                 } else if panel.peek().is_some() {
                     panel.set(None);
+                } else if editing.peek().is_some() {
+                    editing.set(None);
+                    draft.set(String::new());
                 } else if replying.peek().is_some() {
                     replying.set(None);
                 } else if *ctx.wide.peek() {
@@ -239,6 +254,7 @@ pub fn Chat(id: i64) -> Element {
         });
         let (callback, mut attached) = crate::channel();
         let attach = js::on_attach(&callback);
+        let mut uploading = uploading;
         spawn(async move {
             let mut pending = 0;
             while let Some(event) = attached.next().await {
@@ -264,34 +280,99 @@ pub fn Chat(id: i64) -> Element {
                 }
             }
         });
+        let (callback, mut gestures) = crate::channel();
+        let gesture = attach_gestures("messages", &callback);
+        spawn(async move {
+            let mut pops = 0u32;
+            while let Some(event) = gestures.next().await {
+                let parts: Vec<&str> = event.split(':').collect();
+                let Some(mid) = parts.get(1).and_then(|s| s.parse::<i64>().ok()) else { continue };
+                let Some(message) = ctx.messages.peek().iter().find(|m| m.id == mid && !m.deleted).cloned() else { continue };
+                let coord = |i: usize| parts.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or_default();
+                match parts[0] {
+                    "long" => {
+                        let locked = ctx.conversations.peek().iter().any(|c| c.id == id && c.locked);
+                        if locked && message.body.is_empty() && message.sender.id != me {
+                            continue;
+                        }
+                        pressed.set(Some(Pressed { id: mid, x: coord(2), y: coord(3) }));
+                    }
+                    "double" => {
+                        let locked = ctx.conversations.peek().iter().any(|c| c.id == id && c.locked);
+                        if locked {
+                            continue;
+                        }
+                        let liked = message.reactions.iter().any(|r| r.user_id == me && r.emoji == LIKE);
+                        bubble::toggle_reaction(ctx, &message, LIKE.to_string());
+                        if !liked {
+                            pops += 1;
+                            let n = pops;
+                            heart.set(Some((mid, n)));
+                            spawn(async move {
+                                gloo_timers::future::TimeoutFuture::new(1200).await;
+                                if heart.peek().is_some_and(|h| h.1 == n) {
+                                    heart.set(None);
+                                }
+                            });
+                        }
+                    }
+                    "tap" => {
+                        if let Some(media) = message.media.as_ref().filter(|m| m.mime.starts_with("image/")) {
+                            viewer.set(Some(api::media_url(&media.id)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
         if ctx.desktop || *ctx.wide.peek() {
             js::focus_input("composer");
         }
-        (escape, attach)
+        (escape, attach, gesture)
     });
     use_drop(move || {
         js::off_listener(&listeners.0);
         js::off_listener(&listeners.1);
+        js::off_listener(&listeners.2);
     });
 
     let wide = *ctx.wide.read();
+    let side_open = *ctx.side_open.read();
     // Shown big on the call screen.
-    let call_photo = photo.clone().unwrap_or_default();
-    let call_peer = conversation
-        .as_ref()
-        .and_then(|c| c.members.iter().find(|u| u.id != me))
-        .map(|u| u.id as f64)
-        .unwrap_or_default();
+    let call_photo = peer.as_ref().and_then(|u| u.avatar.clone()).unwrap_or_default();
+    let call_peer = peer.as_ref().map(|u| u.id as f64).unwrap_or_default();
+    let peer_id = peer.as_ref().map(|u| u.id);
+    let online = peer_id.is_some_and(|p| ctx.is_online(p));
+    let pressed_id = pressed().map(|p| p.id);
+    let heart_on = heart();
     let mut last_day = String::new();
     rsx! {
         div { class: "screen chat",
             header {
                 if !wide {
-                    button { class: "icon", onclick: move |_| js::pop_screen(), Icon { name: "back" } }
+                    button { class: "icon", title: "Retour", onclick: move |_| js::pop_screen(), Icon { name: "back" } }
                 }
-                Avatar { name: title.clone(), photo, small: true }
-                h2 { "{title}" if !subtitle.is_empty() { small { "{subtitle}" } } }
-                if !group && blocked.is_none() && conversation.is_some() {
+                // One-to-one: the profile; group: the members.
+                button { class: "chat-who", title: if group { "Membres" } else { "Profil" },
+                    onclick: move |_| match peer_id {
+                        Some(user) => ctx.open(Screen::Profile(user)),
+                        None => menu.set(true),
+                    },
+                    if let Some(user) = peer.clone() {
+                        UserAvatar { user, small: true, online }
+                    } else {
+                        Avatar { name: title.clone(), small: true }
+                    }
+                    h2 {
+                        if let Some(user) = peer.clone() {
+                            Name { user }
+                        } else {
+                            "{title}"
+                        }
+                        if !subtitle.is_empty() { small { "{subtitle}" } }
+                    }
+                }
+                if !group && blocked.is_none() && !locked && conversation.is_some() {
                     button { class: "icon", title: "Appel vocal",
                         onclick: { let (t, p) = (title.clone(), call_photo.clone()); move |_| js::start_call_with(id as f64, &t, false, &p, call_peer) },
                         Icon { name: "phone" } }
@@ -299,7 +380,14 @@ pub fn Chat(id: i64) -> Element {
                         onclick: { let (t, p) = (title.clone(), call_photo.clone()); move |_| js::start_call_with(id as f64, &t, true, &p, call_peer) },
                         Icon { name: "video" } }
                 }
-                button { class: "icon", onclick: move |_| menu.set(true), Icon { name: "more" } }
+                if wide {
+                    button { class: if side_open { "icon side-toggle on" } else { "icon side-toggle" },
+                        title: if group { "Membres" } else { "Profil" },
+                        aria_pressed: "{side_open}",
+                        onclick: move |_| ctx.set_side_open(!side_open),
+                        Icon { name: ui::pick(group, "users", "eye") } }
+                }
+                button { class: "icon", title: "Options", onclick: move |_| menu.set(true), Icon { name: "more" } }
             }
             div { class: "messages", id: "messages",
                 if messages.len() >= 50 && !exhausted() {
@@ -314,167 +402,49 @@ pub fn Chat(id: i64) -> Element {
                         let new_day = day != last_day;
                         last_day = day.clone();
                         let mine = m.sender.id == me;
-                        let message_id = m.id;
                         let status = conversation
                             .as_ref()
                             .filter(|_| mine && !m.deleted)
-                            .map(|c| receipt(c, me, m.id))
+                            .map(|c| bubble::receipt(c, me, m.id))
                             .unwrap_or_default();
-                        let reactions = tally(&m, me);
+                        let lifted = pressed_id == Some(m.id);
+                        let pop = heart_on.filter(|h| h.0 == m.id).map(|h| h.1).unwrap_or(0);
                         rsx! {
                             Fragment { key: "{m.id}",
                                 if new_day {
                                     div { class: "day", "{day}" }
                                 }
-                                div { class: if mine { "bubble mine" } else { "bubble" },
-                                    onclick: move |_| { confirm_delete.set(false); selected.set(Some(message_id)); },
-                                    if group && !mine {
-                                        div { class: "who", "{m.sender.display_name}" }
-                                    }
-                                    if let Some(quote) = &m.reply {
-                                        div { class: "quote",
-                                            b { "{quote.sender_name}" }
-                                            span { "{quoted(quote)}" }
-                                        }
-                                    }
-                                    if m.deleted {
-                                        div { class: "gone", "Message supprimé" }
-                                    }
-                                    if let Some(media) = m.media.clone() {
-                                        // Using the player must not open the message menu.
-                                        div { onclick: move |e| e.stop_propagation(),
-                                            Attachment { media, message: m.id, mine, on_view: move |url| viewer.set(Some(url)) }
-                                        }
-                                    }
-                                    if let Some(track) = m.track.clone().filter(|_| !m.deleted) {
-                                        div { onclick: move |e| e.stop_propagation(),
-                                            crate::music::TrackCard { track, slot: format!("msg:{}", m.id) }
-                                        }
-                                    }
-                                    if !m.body.is_empty() {
-                                        div { "{m.body}" }
-                                    }
-                                    div { class: "time", "{ui::time(m.created_at)} {status}" }
-                                    if !reactions.is_empty() {
-                                        div { class: "reactions",
-                                            for (emoji, count, own) in reactions {
-                                                button { key: "{emoji}", class: if own { "reaction own" } else { "reaction" },
-                                                    onclick: {
-                                                        let m = m.clone();
-                                                        move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            toggle_reaction(ctx, &m, emoji.to_string());
-                                                        }
-                                                    },
-                                                    "{emoji} {count}"
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                Bubble { message: m.clone(), group, status, members: members.clone(), lifted, heart: pop, locked }
                             }
                         }
                     }
                 }
-            }
-            if !typing.is_empty() {
-                div { class: "status", "{typing}" }
+                if typing {
+                    div { class: "typing-row", aria_label: "{typing_names}",
+                        if group {
+                            div { class: "typing-names", "{typing_names}" }
+                        }
+                        div { class: "typing-dots", span {} span {} span {} }
+                    }
+                }
             }
             if uploading() {
                 div { class: "status", "Envoi en cours…" }
-            }
-            if recording() {
-                // Covers the composer (hidden by CSS) while the microphone is on.
-                div { class: "recbar",
-                    button { class: "icon rec-cancel", title: "Annuler l'enregistrement",
-                        onclick: move |_| { js::cancel_recording(); recording.set(false); },
-                        Icon { name: "trash" } }
-                    span { class: "rec-dot" }
-                    span { class: "rec-time", id: "rec-time" }
-                    canvas { class: "rec-level", id: "rec-level",
-                        onmounted: move |_| js::record_meter("rec-level", "rec-time") }
-                    button { class: "icon rec-send", title: "Envoyer le message vocal", onclick: record,
-                        Icon { name: "send" } }
-                }
-            }
-            if let Some(m) = replying() {
-                div { class: "replying",
-                    div { class: "quote",
-                        b { "{m.sender.display_name}" }
-                        span { {ui::message_summary(&m)} }
-                    }
-                    button { class: "icon", onclick: move |_| replying.set(None), Icon { name: "hangup" } }
-                }
             }
             if let Some(user) = blocked {
                 div { class: "status",
                     "Vous avez bloqué cette personne."
                     button { class: "link", onclick: move |_| set_blocked(ctx, user, false), "Débloquer" }
                 }
+            } else if locked {
+                composer::LockedBar { peer: peer.clone() }
             } else {
-                div { class: "composer",
-                    input { id: "file", class: "hidden", r#type: "file", accept: "image/*,video/*,audio/*", onchange: file_chosen }
-                    button { class: "icon", title: "Joindre", disabled: uploading() || recording(),
-                        onclick: move |_| panel.set(Some(crate::photos::Panel::Attach)),
-                        Icon { name: "clip" } }
-                    button { class: "icon", title: "Partager un morceau", disabled: recording(),
-                        onclick: move |_| panel.set(Some(crate::photos::Panel::Music)),
-                        Icon { name: "music" } }
-                    input { id: "composer", class: "field", placeholder: "Message", value: "{draft}",
-                        oninput: typed,
-                        onkeydown: move |e| if e.key() == Key::Enter && !e.is_composing() { send_text() },
-                    }
-                    if draft().trim().is_empty() {
-                        button { class: if recording() { "icon recording" } else { "icon" }, disabled: uploading(), onclick: record,
-                            Icon { name: ui::pick(recording(), "stop", "mic") } }
-                    } else {
-                        button { class: "icon send", onclick: move |_| send_text(), Icon { name: "send" } }
-                    }
-                }
+                composer::Composer { id, draft, replying, editing, recording, uploading, panel, members: suggest }
             }
-            if let Some(m) = chosen {
-                div { class: "backdrop", onclick: move |_| selected.set(None),
-                    div { class: "sheet", onclick: move |e| e.stop_propagation(),
-                        div { class: "emojis",
-                            for emoji in REACTIONS {
-                                button { key: "{emoji}",
-                                    onclick: {
-                                        let m = m.clone();
-                                        move |_| { toggle_reaction(ctx, &m, emoji.to_string()); selected.set(None); }
-                                    },
-                                    "{emoji}"
-                                }
-                            }
-                        }
-                        button { class: "action",
-                            onclick: {
-                                let m = m.clone();
-                                move |_| { replying.set(Some(m.clone())); selected.set(None); }
-                            },
-                            "Répondre"
-                        }
-                        if m.sender.id == me {
-                            button { class: "action danger",
-                                onclick: {
-                                    let path = format!("/api/messages/{}", m.id);
-                                    move |_| {
-                                        if !confirm_delete() {
-                                            confirm_delete.set(true);
-                                            return;
-                                        }
-                                        selected.set(None);
-                                        let path = path.clone();
-                                        spawn_forever(async move {
-                                            if let Err(e) = api::delete(&ctx.token(), &path).await {
-                                                ctx.fail(e);
-                                            }
-                                        });
-                                    }
-                                },
-                                if confirm_delete() { "Confirmer la suppression" } else { "Supprimer pour tout le monde" }
-                            }
-                        }
-                    }
+            if let Some((m, p)) = menu_for {
+                MessageMenu { key: "{m.id}", message: m, x: p.x, y: p.y, locked,
+                    on_close: move |_| pressed.set(None),
+                    on_action: act,
                 }
             }
             if menu() {
@@ -543,8 +513,11 @@ fn ConversationMenu(conversation: Conversation, on_close: EventHandler<()>) -> E
                         let user = u.id;
                         rsx! {
                             div { key: "{u.id}", class: "person",
-                                Avatar { name: u.display_name.clone(), photo: u.avatar.clone(), small: true }
-                                span { "{u.display_name}" }
+                                UserAvatar { user: u.clone(), small: true }
+                                button { class: "person-name", title: "Voir le profil",
+                                    onclick: move |_| { on_close.call(()); ctx.open(Screen::Profile(user)); },
+                                    Name { user: u.clone() }
+                                }
                                 button { class: "link", onclick: move |_| set_blocked(ctx, user, !is_blocked),
                                     if is_blocked { "Débloquer" } else { "Bloquer" }
                                 }
@@ -555,128 +528,6 @@ fn ConversationMenu(conversation: Conversation, on_close: EventHandler<()>) -> E
                 if conversation.is_group {
                     button { class: "action danger", onclick: leave,
                         if confirm_leave() { "Confirmer : quitter le groupe" } else { "Quitter le groupe" }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn Attachment(media: Media, message: i64, mine: bool, on_view: EventHandler<String>) -> Element {
-    let url = api::media_url(&media.id);
-    // Voice messages are recorded in a WebM container, always declared audio/*.
-    match media.mime.split('/').next().unwrap_or("") {
-        "image" => {
-            let full = url.clone();
-            rsx! { img { src: "{url}", alt: "{media.name}", onclick: move |_| on_view.call(full.clone()) } }
-        }
-        "video" => rsx! { video { src: "{url}#t=0.1", controls: true, preload: "metadata", playsinline: true } },
-        _ => rsx! { VoiceNote { media, message, mine } },
-    }
-}
-
-/// Audio player of a message: a waveform for voice messages, a slim track for
-/// other audio files. `js/voice.js` draws it and plays it.
-#[component]
-fn VoiceNote(media: Media, message: i64, mine: bool) -> Element {
-    let id = format!("vm-{message}");
-    let voice = media.name.starts_with("message-vocal") || media.mime.contains("webm") || media.mime.contains("ogg");
-    let kind = if voice { "voice" } else { "file" };
-    let unmount = id.clone();
-    use_drop(move || js::voice_unmount(&unmount));
-    let (mount, toggle, speed) = (id.clone(), id.clone(), id.clone());
-    rsx! {
-        div { id: "{id}", class: crate::ui::pick(mine, "vm mine", "vm"),
-            "data-media": "{media.id}", "data-url": "{api::media_url(&media.id)}", "data-kind": kind,
-            "data-state": "idle",
-            onmounted: move |_| js::voice_mount(&mount),
-            button { class: "vm-play", title: "Lire", aria_label: "Lire le message vocal",
-                onclick: move |_| js::voice_toggle(&toggle),
-                span { class: "vm-icon-play", Icon { name: "play" } }
-                span { class: "vm-icon-pause", Icon { name: "pause" } }
-            }
-            div { class: "vm-body",
-                if !voice {
-                    div { class: "vm-name", "{media.name}" }
-                }
-                canvas { class: "vm-wave" }
-                span { class: "vm-time", "data-t": "0:00" }
-            }
-            if voice {
-                button { class: "vm-speed", title: "Vitesse", "data-s": "1×", onclick: move |_| js::voice_speed(&speed) }
-            }
-        }
-    }
-}
-
-#[component]
-pub fn CallOverlay(call: CallView, #[props(default)] wide: bool) -> Element {
-    let active = !call.state.is_empty() && call.state != "idle";
-    let class = match (active, call.video) {
-        (false, _) => "call hidden",
-        (true, true) => "call",
-        (true, false) => "call audio",
-    };
-    let mut class = class.to_string();
-    if wide {
-        class.push_str(" large");
-    }
-    let connected = call.state == "connected";
-    // The face stays on screen until the other person's video takes over.
-    let portrait = active && (!call.video || !connected);
-    if portrait {
-        class.push_str(" portrait");
-    }
-    let kind = if call.video { "Appel vidéo" } else { "Appel vocal" };
-    let (headline, status) = match call.state.as_str() {
-        "incoming" => (format!("{} vous appelle…", call.peer), kind.to_string()),
-        "calling" => (call.peer.clone(), format!("{kind} · ça sonne…")),
-        "connecting" => (call.peer.clone(), "Connexion…".to_string()),
-        _ => (call.peer.clone(), String::new()),
-    };
-    let photo = call.avatar.clone().filter(|a| !a.is_empty());
-    let backdrop = photo.as_ref().map(|id| format!("background-image: url('{}')", api::media_url(id)));
-    // The video elements stay mounted so the streams can be attached at any time.
-    rsx! {
-        div { class,
-            if portrait {
-                div { class: "call-backdrop", style: backdrop.clone().unwrap_or_default(),
-                    "data-empty": "{backdrop.is_none()}" }
-            }
-            video { id: "remote-video", autoplay: true, playsinline: true }
-            video { id: "local-video", autoplay: true, playsinline: true, muted: true }
-            div { class: "who",
-                if portrait {
-                    div { class: crate::ui::pick(call.state == "incoming" || call.state == "calling", "call-face ringing", "call-face"),
-                        Avatar { name: call.peer.clone(), photo }
-                    }
-                }
-                h2 { "{headline}" }
-                if connected {
-                    div { class: "call-timer", id: "call-timer", "data-t": "0:00" }
-                } else {
-                    div { class: "call-status", "{status}" }
-                }
-            }
-            div { class: "buttons",
-                if call.state == "incoming" {
-                    div { class: "answer",
-                        button { class: "round red", title: "Refuser", onclick: move |_| js::reject_call(), Icon { name: "hangup" } }
-                        span { "Refuser" }
-                    }
-                    div { class: "answer",
-                        button { class: "round green pulse", title: "Répondre", onclick: move |_| js::accept_call(),
-                            Icon { name: ui::pick(call.video, "video", "phone") } }
-                        span { "Répondre" }
-                    }
-                } else {
-                    button { class: ui::pick(call.muted, "round on", "round"), title: "Micro", onclick: move |_| js::toggle_mute(),
-                        Icon { name: ui::pick(call.muted, "micoff", "mic") } }
-                    button { class: "round red", title: "Raccrocher", onclick: move |_| js::hangup(), Icon { name: "hangup" } }
-                    if call.video {
-                        button { class: ui::pick(call.camera_off, "round on", "round"), title: "Caméra", onclick: move |_| js::toggle_camera(),
-                            Icon { name: ui::pick(call.camera_off, "videooff", "video") } }
                     }
                 }
             }

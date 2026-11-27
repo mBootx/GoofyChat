@@ -136,18 +136,61 @@ impl Drop for Unfinished {
     }
 }
 
-/// Deletes expired sessions, uploads never attached to a message, and stray files.
+/// SQL condition: the media row `{id}` is used by nothing (messages, avatars, avatar
+/// stills, banners, story files and posters).
+fn unused(id: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM messages WHERE media_id = {id})
+         AND NOT EXISTS (SELECT 1 FROM users WHERE avatar = {id})
+         AND NOT EXISTS (SELECT 1 FROM users WHERE avatar_still = {id})
+         AND NOT EXISTS (SELECT 1 FROM users WHERE banner = {id})
+         AND NOT EXISTS (SELECT 1 FROM stories WHERE media_id = {id})
+         AND NOT EXISTS (SELECT 1 FROM stories WHERE poster_id = {id})"
+    )
+}
+
+/// Whether anything uses this media row.
+pub async fn in_use(state: &AppState, id: &str) -> Result<bool> {
+    let free = sqlx::query(&format!("SELECT 1 WHERE {}", unused("?1")))
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+    Ok(free.is_none())
+}
+
+/// Reads a whole media file (only for small files: images).
+pub async fn read(state: &AppState, id: &str) -> Result<Vec<u8>> {
+    Ok(tokio::fs::read(state.config.data_dir.join("media").join(id)).await?)
+}
+
+/// Stores bytes made by the server as a new media row of `owner`; returns its id.
+pub async fn store(state: &AppState, owner: i64, mime: &str, name: &str, bytes: &[u8]) -> Result<String> {
+    let id = random_hex(24);
+    let path = state.config.data_dir.join("media").join(&id);
+    let mut guard = Unfinished(Some(path.clone()));
+    tokio::fs::write(&path, bytes).await?;
+    sqlx::query("INSERT INTO media (id, owner_id, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(&id)
+        .bind(owner)
+        .bind(mime)
+        .bind(name)
+        .bind(bytes.len() as i64)
+        .bind(now_ms())
+        .execute(&state.db)
+        .await?;
+    guard.0 = None;
+    Ok(id)
+}
+
+/// Deletes expired sessions, failed stories, uploads never used, and stray files.
 pub async fn cleanup(state: &AppState) -> Result<()> {
     let day = 24 * 3600 * 1000;
     sqlx::query("DELETE FROM sessions WHERE created_at <= ?")
         .bind(now_ms() - crate::auth::SESSION_MS)
         .execute(&state.db)
         .await?;
-    sqlx::query(
-        "DELETE FROM media WHERE created_at < ?
-         AND id NOT IN (SELECT media_id FROM messages WHERE media_id IS NOT NULL)
-         AND id NOT IN (SELECT avatar FROM users WHERE avatar IS NOT NULL)",
-    )
+    crate::stories::cleanup_failed(state, now_ms()).await?;
+    sqlx::query(&format!("DELETE FROM media WHERE created_at < ?1 AND {}", unused("media.id")))
     .bind(now_ms() - day)
     .execute(&state.db)
     .await?;
@@ -172,11 +215,7 @@ pub async fn cleanup(state: &AppState) -> Result<()> {
 
 /// Removes the file of an upload that nothing uses any more.
 pub async fn discard(state: &AppState, id: &str) -> Result<()> {
-    let removed = sqlx::query(
-        "DELETE FROM media WHERE id = ?1
-         AND NOT EXISTS (SELECT 1 FROM messages WHERE media_id = ?1)
-         AND NOT EXISTS (SELECT 1 FROM users WHERE avatar = ?1)",
-    )
+    let removed = sqlx::query(&format!("DELETE FROM media WHERE id = ?1 AND {}", unused("?1")))
     .bind(id)
     .execute(&state.db)
     .await?;
@@ -199,13 +238,18 @@ pub async fn download(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Response> {
+    serve(&state, &id, request, "private, max-age=31536000").await
+}
+
+/// Serves a media row's file with its mime, Range support and `nosniff`.
+pub async fn serve(state: &AppState, id: &str, request: Request, cache: &'static str) -> Result<Response> {
     let mime: Option<(String,)> = sqlx::query_as("SELECT mime FROM media WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.db)
         .await?;
     let (mime,) = mime.ok_or_else(not_found)?;
     // The id was found in the database, so it is a hex string we generated.
-    let path = state.config.data_dir.join("media").join(&id);
+    let path = state.config.data_dir.join("media").join(id);
     let mut response = ServeFile::new(path)
         .oneshot(request)
         .await
@@ -216,6 +260,6 @@ pub async fn download(
         headers.insert(header::CONTENT_TYPE, v);
     }
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=31536000"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
     Ok(response)
 }

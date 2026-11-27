@@ -1,23 +1,14 @@
-//! Profile, blocked people, sign out and account deletion.
+//! Blocked people, appearance, sounds, SelfHost-hub links, desktop app, sign out and
+//! account deletion (contract 0.4.0 §7.5; profile editing lives in `profile::EditProfile`).
 
 use crate::{
     api, js,
-    ui::{Avatar, Icon},
+    ui::{Icon, Name, UserAvatar},
     Ctx,
 };
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
-use proto::{DeleteAccount, Profile, User};
-
-async fn save(ctx: Ctx, profile: Profile) {
-    match api::put::<_, User>(&ctx.token(), "/api/me", &profile).await {
-        Ok(user) => {
-            ctx.set_user(user);
-            ctx.notify("Profil enregistré.");
-        }
-        Err(e) => ctx.fail(e),
-    }
-}
+use proto::DeleteAccount;
 
 /// Start with Windows, version and updates. Only inside the desktop app.
 #[component]
@@ -81,38 +72,10 @@ fn DesktopSettings() -> Element {
 pub fn Settings() -> Element {
     let ctx = use_context::<Ctx>();
     let user = ctx.session.read().as_ref().map(|s| s.user.clone());
-    let mut name = use_signal(|| ctx.session.peek().as_ref().map(|s| s.user.display_name.clone()).unwrap_or_default());
     let mut password = use_signal(String::new);
     let mut confirm_delete = use_signal(|| false);
     let blocked = ctx.blocked.read().clone();
     let Some(user) = user else { return rsx! {} };
-
-    let current_name = move || ctx.session.peek().as_ref().map(|s| s.user.display_name.clone()).unwrap_or_default();
-
-    let photo_chosen = move |_| {
-        let display_name = current_name();
-        // Keeps going if the user leaves the screen.
-        spawn_forever(async move {
-            match js::upload_from_input("avatar-file").await {
-                Ok(value) => {
-                    if let Some(id) = value.as_string().filter(|s| !s.is_empty()) {
-                        save(ctx, Profile { display_name, avatar_id: Some(id), remove_avatar: false }).await;
-                    }
-                }
-                Err(e) => ctx.notify(e.as_string().unwrap_or_else(|| "Échec de l'envoi.".into())),
-            }
-        });
-    };
-
-    let remove_photo = move |_| {
-        let profile = Profile { display_name: current_name(), avatar_id: None, remove_avatar: true };
-        spawn_forever(save(ctx, profile));
-    };
-
-    let save_name = move |_| {
-        let profile = Profile { display_name: name(), avatar_id: None, remove_avatar: false };
-        spawn_forever(save(ctx, profile));
-    };
 
     let logout = move |_| {
         spawn_forever(async move {
@@ -145,30 +108,18 @@ pub fn Settings() -> Element {
     rsx! {
         div { class: "screen",
             header {
-                button { class: "icon", onclick: move |_| js::pop_screen(), Icon { name: "back" } }
+                button { class: "icon", title: "Retour", onclick: move |_| ctx.back(), Icon { name: "back" } }
                 h2 { "Réglages" small { "@{user.username}" } }
             }
             div { class: "list pad",
-                div { class: "profile",
-                    Avatar { name: user.display_name.clone(), photo: user.avatar.clone() }
-                    input { id: "avatar-file", class: "hidden", r#type: "file", accept: "image/*", onchange: photo_chosen }
-                    button { class: "link", onclick: move |_| js::pick_file("avatar-file"), "Changer la photo" }
-                    if user.avatar.is_some() {
-                        button { class: "link", onclick: remove_photo, "Retirer la photo" }
-                    }
-                }
-                input { class: "field", placeholder: "Nom affiché", value: "{name}",
-                    oninput: move |e| name.set(e.value()) }
-                button { class: "primary", onclick: save_name, "Enregistrer le nom" }
-
                 h3 { "Personnes bloquées" }
                 if blocked.is_empty() {
                     div { class: "hint", "Personne." }
                 }
                 for u in blocked {
                     div { key: "{u.id}", class: "person",
-                        Avatar { name: u.display_name.clone(), photo: u.avatar.clone(), small: true }
-                        span { "{u.display_name}" }
+                        UserAvatar { user: u.clone(), small: true }
+                        span { Name { user: u.clone() } }
                         button { class: "link",
                             onclick: move |_| {
                                 spawn_forever(async move {

@@ -428,14 +428,20 @@ pub async fn cover(
     Err(Error(StatusCode::SERVICE_UNAVAILABLE, "Aucun compte goofysound lié ne permet d'afficher cette pochette.".into()))
 }
 
-/// The user and everyone sharing a conversation with them, minus blocks either way.
+/// The user, their friends and everyone sharing a conversation with them, minus blocks
+/// either way. Also the audience of profile changes.
 pub async fn audience(state: &AppState, user: i64) -> Result<Vec<i64>> {
     let rows: Vec<(i64,)> = sqlx::query_as(
-        "SELECT DISTINCT b.user_id FROM members a
-         JOIN members b ON b.conversation_id = a.conversation_id
-         WHERE a.user_id = ?1 AND b.user_id != ?1
+        "SELECT other FROM (
+             SELECT b.user_id AS other FROM members a
+             JOIN members b ON b.conversation_id = a.conversation_id
+             WHERE a.user_id = ?1
+             UNION
+             SELECT CASE WHEN user_a = ?1 THEN user_b ELSE user_a END FROM friendships
+             WHERE user_a = ?1 OR user_b = ?1)
+         WHERE other != ?1
            AND NOT EXISTS (SELECT 1 FROM blocks
-             WHERE (user_id = ?1 AND blocked_id = b.user_id) OR (user_id = b.user_id AND blocked_id = ?1))",
+             WHERE (user_id = ?1 AND blocked_id = other) OR (user_id = other AND blocked_id = ?1))",
     )
     .bind(user)
     .fetch_all(&state.db)

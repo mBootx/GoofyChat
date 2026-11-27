@@ -53,6 +53,14 @@ extern "C" {
     pub fn toggle_mute();
     #[wasm_bindgen(js_name = toggleCamera)]
     pub fn toggle_camera();
+    #[wasm_bindgen(catch, js_name = startScreenShare)]
+    pub async fn start_screen_share() -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = stopScreenShare)]
+    pub fn stop_screen_share();
+    #[wasm_bindgen(js_name = toggleFullscreen)]
+    pub fn toggle_fullscreen(element_id: &str);
+    #[wasm_bindgen(js_name = syncCallMedia)]
+    pub fn sync_call_media();
 
     // ---- layout and keyboard ----
 

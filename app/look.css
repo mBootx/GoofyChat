@@ -1,0 +1,87 @@
+/* Customization (package F1). js/look.js sets these on <html>:
+     data-bubble = round | square | flat | pill | tail
+     data-font   = id of a body font (absent: system font), with --msg-font
+     data-wall, data-compact, data-motion="reduced" (motion tokens are in motion.css)
+     --bubble-mine (gradient or solid), --mine-text, --mine-solid, --mine-tail,
+     --in, --in-text, --in-flat
+   The base `.bubble` rules (round shape) are in style.css / chat.css. The `.shape[data-shape]`
+   selectors give the settings previews their own shape: they are more specific than the
+   `[data-bubble]` ones, so they win whatever the current shape is. */
+
+/* Colours of the bubbles (--in-text is the theme text colour unless received bubbles are custom). */
+.bubble:not(.mine) { color: var(--in-text, inherit); }
+
+/* ---------- Bubble shapes ---------- */
+[data-bubble="square"] .bubble, .shape[data-shape="square"] .bubble { border-radius: 8px; }
+[data-bubble="square"] .bubble.mine, .shape[data-shape="square"] .bubble.mine { border-radius: 8px 8px 3px 8px; }
+[data-bubble="square"] .bubble:not(.mine), .shape[data-shape="square"] .bubble:not(.mine) { border-radius: 8px 8px 8px 3px; }
+
+[data-bubble="flat"] .bubble, .shape[data-shape="flat"] .bubble { border-radius: 14px; box-shadow: none; }
+[data-bubble="flat"] .bubble.mine, .shape[data-shape="flat"] .bubble.mine { background: var(--mine-solid, var(--accent)); }
+[data-bubble="flat"] .bubble:not(.mine), .shape[data-shape="flat"] .bubble:not(.mine) {
+  background: var(--in-flat, color-mix(in srgb, var(--line) 70%, var(--in))); }
+
+[data-bubble="pill"] .bubble, .shape[data-shape="pill"] .bubble { border-radius: 22px; padding-left: 15px; padding-right: 15px; }
+[data-bubble="pill"] .bubble.mine, .shape[data-shape="pill"] .bubble.mine { border-radius: 22px; }
+[data-bubble="pill"] .bubble:not(.mine), .shape[data-shape="pill"] .bubble:not(.mine) { border-radius: 22px; }
+
+/* Classic speech bubble: a small tail on the bottom corner, drawn by ::after (the bubble is
+   the positioning context). The tail has the colour of the bubble's end. */
+[data-bubble="tail"] .bubble, .shape[data-shape="tail"] .bubble { position: relative; border-radius: 16px; }
+[data-bubble="tail"] .bubble.mine, .shape[data-shape="tail"] .bubble.mine { border-bottom-right-radius: 0; }
+[data-bubble="tail"] .bubble:not(.mine), .shape[data-shape="tail"] .bubble:not(.mine) { border-bottom-left-radius: 0; }
+[data-bubble="tail"] .bubble::after, .shape[data-shape="tail"] .bubble::after {
+  content: ""; position: absolute; bottom: 0; width: 9px; height: 12px; pointer-events: none; }
+[data-bubble="tail"] .bubble.mine::after, .shape[data-shape="tail"] .bubble.mine::after {
+  right: -7px; background: var(--mine-tail, var(--accent-2)); clip-path: polygon(0 0, 0 100%, 100% 100%); }
+[data-bubble="tail"] .bubble:not(.mine)::after, .shape[data-shape="tail"] .bubble:not(.mine)::after {
+  left: -7px; background: var(--in); clip-path: polygon(100% 0, 0 100%, 100% 100%); }
+
+/* ---------- Message font ---------- */
+[data-font] .bubble, [data-font] .composer textarea, [data-font] .composer input { font-family: var(--msg-font); }
+/* Faces that look small next to the system font. */
+[data-font="caveat"] .bubble { font-size: 1.15em; }
+[data-font="comfortaa"] .bubble { font-size: .96em; }
+
+/* ---------- Wallpapers of the conversation ---------- */
+[data-wall="dots"] .chat .messages, .wall[data-wall="dots"] .wall-art {
+  background-image: radial-gradient(color-mix(in srgb, var(--accent) 22%, transparent) 1.2px, transparent 1.4px);
+  background-size: 18px 18px; }
+[data-wall="grid"] .chat .messages, .wall[data-wall="grid"] .wall-art {
+  background-image: linear-gradient(color-mix(in srgb, var(--accent) 12%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 12%, transparent) 1px, transparent 1px);
+  background-size: 24px 24px; }
+[data-wall="waves"] .chat .messages, .wall[data-wall="waves"] .wall-art {
+  background-image: radial-gradient(circle at 50% 120%, transparent 46%, color-mix(in srgb, var(--accent) 14%, transparent) 47%, transparent 52%);
+  background-size: 36px 18px; }
+[data-wall="glow"] .chat .messages, .wall[data-wall="glow"] .wall-art {
+  background-image: radial-gradient(ellipse at 0% 0%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 55%),
+    radial-gradient(ellipse at 100% 100%, color-mix(in srgb, var(--accent-2) 22%, transparent), transparent 55%);
+  background-attachment: local; }
+
+/* ---------- Compact mode ---------- */
+[data-compact] .messages { gap: 2px; padding-top: 6px; padding-bottom: 6px; }
+[data-compact] .bubble { padding: 5px 10px; }
+[data-compact] .row { padding-top: 7px; padding-bottom: 7px; }
+[data-compact] .avatar { width: 40px; height: 40px; font-size: 15px; }
+[data-compact] .avatar.small { width: 32px; height: 32px; font-size: 13px; }
+[data-compact] .day { margin: 4px 0; }
+
+/* ---------- Settings: shapes, colours and fonts (theme.rs) ---------- */
+.shapes { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
+.shape { display: flex; flex-direction: column; gap: 6px; padding: 6px; border-radius: 14px; border: 2px solid transparent; text-align: center; font-size: 12px; }
+.shape.on { border-color: var(--accent); }
+.shape-art { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line); overflow: hidden; }
+.shape-art .bubble { font-size: 11px; padding: 4px 9px; max-width: none; white-space: nowrap; cursor: default; }
+.shape-art .bubble:not(.mine) { align-self: flex-start; }
+.shape-art .bubble.mine { align-self: flex-end; }
+.shape-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* "Theme colour" choice: half and half, like the theme's gradient ends. */
+.accent-dot.theme { background: linear-gradient(135deg, var(--accent) 50%, var(--accent-2) 50%); }
+
+.fonts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.font-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 9px 12px; border-radius: 12px; border: 2px solid var(--line); background: var(--surface); text-align: left; min-width: 0; }
+.font-opt.on { border-color: var(--accent); }
+.font-sample { font-size: 16px; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.font-name { font-size: 12px; color: var(--muted); }

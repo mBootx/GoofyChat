@@ -1,13 +1,15 @@
 # Goofy Chat
 
-Self-hosted chat for Android and Windows: one-to-one and group conversations,
-photo, video and audio sending, voice messages, replies, reactions, typing
-indicators, read receipts, profile photos, a directory of all members,
-one-to-one voice and video calls, and notifications without any third-party
-push service. People can block each other, leave groups,
-delete their messages and delete their account. Each device can change the
-theme, accent colour, bubble style, chat wallpaper, text size and ringtone.
-The interface is in French.
+Self-hosted chat for Android, Windows and Linux: friends (added by username),
+one-to-one and group conversations, rich profiles (bio, banner, animated avatar,
+name font and colour), 24-hour photo and video stories with a private archive,
+photo, video and audio sending, in-chat camera, voice messages, replies,
+reactions, edits, `@mentions`, typing indicators, read receipts, online
+presence, one-to-one voice and video calls with screen sharing, and
+notifications without any third-party push service. People can block each other,
+leave groups, delete their messages and delete their account. Each device can
+change the theme, accent colour, bubble style and colours, message font, chat
+wallpaper, text size, reduced motion and ringtone. The interface is in French.
 
 There is no end-to-end encryption: HTTPS protects traffic in transit, but the
 server administrator can read messages and files.
@@ -16,11 +18,11 @@ server administrator can read messages and files.
 
 | Folder | Content |
 |---|---|
-| `server/` | Rust API and WebSocket server (axum, SQLite) |
+| `server/` | Rust API and WebSocket server (axum, SQLite), plus the `story-worker` binary |
 | `proto/` | Types shared by the server and the app |
-| `app/` | The app: Dioxus UI, `js/bridge.js` for media and calls, Tauri 2 shell (`src-tauri/`, with `desktop.rs` for the Windows tray, notifications and updates), Kotlin code for Android (`android/`) |
-| `deploy/` | Docker Compose stack: chat server and coturn (call relay) |
-| `build/` | Scripts that build the signed APK (Docker, Linux) and the Windows installer |
+| `app/` | The app: Dioxus UI, `js/bridge.js` for media and calls, Tauri 2 shell (`src-tauri/`, with `desktop.rs` for the Windows/Linux tray, notifications and updates), Kotlin code for Android (`android/`) |
+| `deploy/` | Docker Compose stack: chat server, stories worker (ffmpeg) and coturn (call relay) |
+| `build/` | Scripts that build the signed APK (Docker, Linux) and the desktop packages |
 
 ## Server
 
@@ -32,6 +34,9 @@ TURN_SECRET=<long random string>
 PUBLIC_IP=<public IPv4 address>
 LAN_IP=<LAN address of the server>
 INVITE_CODE=<optional: required to sign up; leave empty for open sign-up>
+WORKER_TOKEN=<long random string; empty disables video stories and archive compression>
+# Optional: local-time hours window for compressing expired story archives (default 2-6; empty = any time).
+ARCHIVE_HOURS=2-6
 ```
 
 Then run `docker compose up -d --build` in `deploy/`. The server tests run
@@ -40,8 +45,16 @@ during the image build.
 - A reverse proxy must terminate HTTPS, forward to `LAN_IP:8880` with WebSocket
   support, and set `X-Real-IP`.
 - For calls, forward port `7880` (TCP and UDP) and UDP `10000-10100` on the router.
+- The `stories` worker container runs `ffmpeg` at low priority (`nice -n 19`,
+  1 CPU core, `cpu_shares: 128`, 512 MB RAM, `-threads 1`), one job at a time.
+  It prepares new video stories right away (remuxing without re-encoding when
+  the upload already fits the live format) and compresses expired story archives
+  only during `ARCHIVE_HOURS`. It talks to the server over the private Docker
+  network on port `8081` (never published).
+- Per-user media storage quota defaults to 5 GB (`USER_QUOTA_MB=5120`), shared
+  across messages, profile media and archived stories.
 - All data is in the `goofychat_data` Docker volume. Back it up. It includes
-  `secret.key`, which signs music and photo links and encrypts the stored
+  `secret.key`, which signs music, photo and story links and encrypts the stored
   FileBrowser passwords. Losing it means everyone must link their photos again.
 
 ## SelfHost-hub (music and photos)
@@ -76,8 +89,8 @@ first, then keeps:
 
 Unlinking, or deleting the Goofy Chat account, removes them. Shared songs play
 for every member of the conversation, using the sharer's account. Who is
-listening is visible only to people who share a conversation with that person,
-and never between people who blocked each other.
+listening is visible to friends and to people who share a conversation with that
+person, and never between people who blocked each other.
 
 ## APK
 
@@ -150,7 +163,7 @@ publish a release can offer an update, so protect the GitHub account.
 - Calls are one-to-one only.
 - Blocking stops private messages, calls and new invitations. Messages from a
   blocked person stay visible in groups you share.
-- Messages cannot be edited, and members cannot be added to an existing group.
+- Members cannot be added to an existing group.
 - A notification already shown stays after its message is deleted.
 - Android may still delay notifications on a sleeping phone, and some
   manufacturers block the restart after a reboot.

@@ -25,6 +25,11 @@ pub struct Config {
     pub filebrowser_url: String,
     /// Camera-backup folder; `{user}` is the FileBrowser account name.
     pub photos_folder: String,
+    /// Shared secret with the stories worker; empty disables video stories and archive
+    /// compression (and the internal listener).
+    pub worker_token: String,
+    /// Address of the internal worker API.
+    pub worker_bind: String,
 }
 
 pub const DEFAULT_PHOTOS_FOLDER: &str = "/backups/photos/{user}";
@@ -38,7 +43,7 @@ impl Config {
         Config {
             data_dir: var("DATA_DIR", "/data").into(),
             max_upload: mb("MAX_UPLOAD_MB", "100"),
-            user_quota: mb("USER_QUOTA_MB", "2048"),
+            user_quota: mb("USER_QUOTA_MB", "5120"),
             total_quota: mb("TOTAL_QUOTA_MB", "51200"),
             turn_host: var("TURN_HOST", ""),
             turn_secret: var("TURN_SECRET", ""),
@@ -50,6 +55,9 @@ impl Config {
             } else {
                 folder.trim().trim_end_matches('/').to_string()
             },
+            worker_token: var("WORKER_TOKEN", "").trim().to_string(),
+            worker_bind: Some(var("WORKER_BIND", "")).filter(|b| !b.trim().is_empty())
+                .unwrap_or_else(|| "0.0.0.0:8081".into()),
         }
     }
 }
@@ -88,10 +96,17 @@ pub struct FileSession {
     pub root: String,
 }
 
-/// Adds the columns missing from a database created by an earlier version.
+/// Adds the columns missing from a database created by an earlier version, then runs
+/// the one-time data migrations not yet recorded in `meta`.
 pub async fn migrate(db: &SqlitePool) -> Result<(), sqlx::Error> {
     const COLUMNS: &[(&str, &str, &str)] = &[
         ("users", "avatar", "TEXT"),
+        ("users", "bio", "TEXT NOT NULL DEFAULT ''"),
+        ("users", "banner", "TEXT"),
+        ("users", "avatar_still", "TEXT"),
+        ("users", "name_font", "TEXT NOT NULL DEFAULT ''"),
+        ("users", "name_color", "TEXT NOT NULL DEFAULT ''"),
+        ("messages", "edited_at", "INTEGER"),
         ("messages", "reply_to", "INTEGER"),
         ("messages", "deleted", "INTEGER NOT NULL DEFAULT 0"),
         ("messages", "track_id", "TEXT"),
@@ -115,7 +130,46 @@ pub async fn migrate(db: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql("CREATE INDEX IF NOT EXISTS idx_messages_track ON messages(track_id)")
         .execute(db)
         .await?;
+
+    // 0.4.0: people who already share a one-to-one conversation become friends, unless
+    // one blocked the other. Pairs who only share a group do not.
+    let mut tx = db.begin().await?;
+    let done = sqlx::query("SELECT 1 FROM meta WHERE key = 'friends_from_direct'")
+        .fetch_optional(&mut *tx)
+        .await?;
+    if done.is_none() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO friendships (user_a, user_b, created_at)
+             SELECT a.user_id, b.user_id, c.created_at
+             FROM conversations c
+             JOIN members a ON a.conversation_id = c.id
+             JOIN members b ON b.conversation_id = c.id AND b.user_id > a.user_id
+             WHERE c.is_group = 0
+               AND NOT EXISTS (SELECT 1 FROM blocks
+                               WHERE (user_id = a.user_id AND blocked_id = b.user_id)
+                                  OR (user_id = b.user_id AND blocked_id = a.user_id))",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO meta (key, value) VALUES ('friends_from_direct', ?)")
+            .bind(crate::auth::now_ms().to_string())
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
+}
+
+/// Who is online, in memory. A user is online while at least one of their sockets is
+/// active; going offline is announced after a grace delay (see `presence.rs`).
+#[derive(Default)]
+pub struct Presence {
+    /// Active sockets per user.
+    pub active: HashMap<i64, usize>,
+    /// Users whose friends were told they are online.
+    pub online: HashSet<i64>,
+    /// Bumped each time a user's last active socket goes, so stale offline timers do nothing.
+    pub epoch: HashMap<i64, u64>,
 }
 
 pub struct PendingCall {
@@ -155,6 +209,12 @@ pub struct AppState {
     pub months: Arc<Mutex<HashMap<i64, (Instant, Arc<Vec<crate::photos::Month>>)>>>,
     /// Account used by the next `getNowPlaying` poll.
     pub poller: Arc<Mutex<usize>>,
+    /// Online state of users (see `presence.rs`).
+    pub presence: Arc<Mutex<Presence>>,
+    /// How long a user stays online after their last active socket went.
+    pub offline_grace: Duration,
+    /// Image decoding (avatars, banners, story photos): one at a time bounds the memory.
+    pub imaging: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -198,7 +258,15 @@ impl AppState {
             activity: Default::default(),
             months: Default::default(),
             poller: Default::default(),
+            presence: Default::default(),
+            offline_grace: Duration::from_secs(15),
+            imaging: Arc::new(Semaphore::new(1)),
         })
+    }
+
+    /// Whether video stories and archive compression are available.
+    pub fn has_worker(&self) -> bool {
+        !self.config.worker_token.is_empty()
     }
 
     /// Sliding-window rate limit. Returns false once `max` is reached.

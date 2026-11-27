@@ -14,8 +14,11 @@ services:
       # Empty means anyone can create an account.
       INVITE_CODE: ${INVITE_CODE:-}
       MAX_UPLOAD_MB: "100"
-      USER_QUOTA_MB: "2048"
+      USER_QUOTA_MB: "5120"
       TOTAL_QUOTA_MB: "51200"
+      # Stories worker (internal API on WORKER_BIND, never published). Empty disables video stories.
+      WORKER_TOKEN: ${WORKER_TOKEN:-}
+      WORKER_BIND: 0.0.0.0:8081
       # SelfHost-hub. Empty disables the feature.
       # goofysound, reached by container name through the navidrome_default network.
       NAVIDROME_URL: ${NAVIDROME_URL:-http://navidrome:4533}
@@ -34,6 +37,33 @@ services:
       - no-new-privileges:true
     cap_drop: [ALL]
     mem_limit: 512m
+
+  stories:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile.worker
+      network: host
+    image: goofychat-stories
+    restart: unless-stopped
+    depends_on: [server]
+    environment:
+      SERVER_URL: http://server:8081
+      WORKER_TOKEN: ${WORKER_TOKEN:-}
+      FFMPEG_THREADS: "1"
+      ARCHIVE_HOURS: ${ARCHIVE_HOURS-2-6}
+    networks:
+      - default
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 512m
+    cpus: 1.0
+    cpu_shares: 128
 
   turn:
     image: coturn/coturn:4.9
@@ -69,7 +99,6 @@ services:
       - --denied-peer-ip=169.254.0.0-169.254.255.255
       - --denied-peer-ip=172.16.0.0-172.31.255.255
       - --denied-peer-ip=192.168.0.0-192.168.255.255
-      - --denied-peer-ip=${PUBLIC_IP}
       - --denied-peer-ip=::1
       - --denied-peer-ip=::ffff:0:0-::ffff:ffff:ffff
       - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff

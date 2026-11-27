@@ -16,13 +16,25 @@ struct Look {
     mode: String,
     /// "#rrggbb", empty for the preset's colour.
     accent: String,
-    /// "round", "square" or "flat".
+    /// "round", "square", "flat", "pill" or "tail".
     bubble: String,
     /// "s", "m", "l" or "xl".
     size: String,
     /// "none", "dots", "grid", "waves" or "glow".
     wall: String,
     compact: bool,
+    /// "#rrggbb" for my bubbles, empty for the theme gradient.
+    #[serde(rename = "mineColor", default)]
+    mine_color: String,
+    /// "#rrggbb" for received bubbles, empty for the theme.
+    #[serde(rename = "inColor", default)]
+    in_color: String,
+    /// Empty (system font) or the id of a `proto::FONTS` entry with `body: true`.
+    #[serde(default)]
+    font: String,
+    /// "auto" (follow the system) or "reduced".
+    #[serde(default)]
+    motion: String,
 }
 
 #[derive(Deserialize, Clone, PartialEq)]
@@ -67,6 +79,10 @@ fn load_look() -> Look {
         size: "m".into(),
         wall: "none".into(),
         compact: false,
+        mine_color: String::new(),
+        in_color: String::new(),
+        font: String::new(),
+        motion: "auto".into(),
     })
 }
 
@@ -85,7 +101,11 @@ fn presets() -> Vec<Preset> {
 }
 
 const MODES: [(&str, &str); 3] = [("auto", "Auto"), ("light", "Clair"), ("dark", "Sombre")];
-const BUBBLES: [(&str, &str); 3] = [("round", "Arrondies"), ("square", "Carrées"), ("flat", "Unies")];
+const BUBBLES: [(&str, &str); 5] =
+    [("round", "Arrondies"), ("square", "Carrées"), ("flat", "Unies"), ("pill", "Pilule"), ("tail", "Avec queue")];
+/// Suggested colours for received bubbles (the picker accepts any colour).
+const IN_COLORS: [&str; 8] =
+    ["#ffffff", "#f1f0f5", "#e8e4ff", "#dbeafe", "#dcfce7", "#fde7e0", "#2a2a36", "#0f0f16"];
 const WALLS: [(&str, &str); 5] =
     [("none", "Aucun"), ("dots", "Points"), ("grid", "Grille"), ("waves", "Vagues"), ("glow", "Lueur")];
 const SIZES: [(&str, &str); 4] = [("s", "Petit"), ("m", "Normal"), ("l", "Grand"), ("xl", "Très grand")];
@@ -93,6 +113,54 @@ const ACCENTS: [&str; 8] = ["#6c4cf1", "#0b84d8", "#2f9e5b", "#ef5a3c", "#ec4899
 const RINGS: [(&str, &str); 5] =
     [("classic", "Classique"), ("soft", "Douce"), ("retro", "Rétro"), ("goofy", "Goofy"), ("marimba", "Marimba")];
 const TONES: [(&str, &str); 5] = [("pop", "Pop"), ("ding", "Ding"), ("drop", "Goutte"), ("bit", "8-bit"), ("boing", "Boing")];
+
+/// `color` made readable on the current theme (WCAG contrast of at least 3:1 against the
+/// background and surface colours, same hue), for a profile name colour. Empty stays empty.
+#[allow(dead_code)]
+pub fn name_color(color: &str) -> String {
+    bindings::look_name_color(color)
+}
+
+/// Bindings of `js/look.js` that only this file uses (the others are in `js.rs`).
+mod bindings {
+    use wasm_bindgen::prelude::wasm_bindgen;
+
+    #[wasm_bindgen(module = "/js/look.js")]
+    extern "C" {
+        #[wasm_bindgen(js_name = lookNameColor)]
+        pub fn look_name_color(color: &str) -> String;
+    }
+}
+
+/// A row of colour choices: "theme" (empty value), swatches and a free picker.
+#[component]
+fn ColorChoice(
+    label: &'static str,
+    value: String,
+    swatches: Vec<&'static str>,
+    fallback: String,
+    on_pick: EventHandler<String>,
+) -> Element {
+    let custom = !value.is_empty() && !swatches.iter().any(|s| value.eq_ignore_ascii_case(s));
+    let picker = if value.is_empty() { fallback } else { value.clone() };
+    rsx! {
+        div { class: "accents", role: "group", aria_label: "{label}",
+            button { title: "Couleur du thème", aria_label: "Couleur du thème",
+                class: crate::ui::pick(value.is_empty(), "accent-dot theme on", "accent-dot theme"),
+                onclick: move |_| on_pick.call(String::new()) }
+            for color in swatches {
+                button { key: "{color}", title: "{color}", style: "background: {color}",
+                    class: crate::ui::pick(value.eq_ignore_ascii_case(color), "accent-dot on", "accent-dot"),
+                    onclick: move |_| on_pick.call(color.to_string()) }
+            }
+            label { title: "Couleur personnalisée",
+                class: crate::ui::pick(custom, "accent-dot custom on", "accent-dot custom"),
+                style: if custom { format!("background: {value}") } else { String::new() },
+                input { r#type: "color", value: "{picker}", oninput: move |e| on_pick.call(e.value()) }
+            }
+        }
+    }
+}
 
 /// Segmented choice among a few options.
 #[component]
@@ -125,6 +193,7 @@ pub fn Appearance() -> Element {
         swatches.set(presets());
     };
     let current = look();
+    let reduced = current.motion == "reduced";
     let accent_value = if current.accent.is_empty() {
         swatches.read().iter().find(|p| p.id == current.preset).map(|p| p.a.clone()).unwrap_or("#6c4cf1".into())
     } else {
@@ -167,9 +236,45 @@ pub fn Appearance() -> Element {
                 button { class: "link", onclick: move |_| set(Box::new(|l| l.accent.clear())), "Couleur du thème" }
             }
         }
-        div { class: "setting-label", "Bulles" }
-        Segments { options: BUBBLES.to_vec(), value: current.bubble.clone(),
-            on_pick: move |id: &'static str| set(Box::new(move |l| l.bubble = id.into())) }
+        div { class: "setting-label", "Forme des bulles" }
+        div { class: "shapes", role: "radiogroup",
+            for (id, label) in BUBBLES {
+                button { key: "{id}", role: "radio", aria_checked: "{current.bubble == id}", "data-shape": "{id}",
+                    class: crate::ui::pick(current.bubble == id, "shape on", "shape"),
+                    onclick: move |_| set(Box::new(move |l| l.bubble = id.into())),
+                    span { class: "shape-art",
+                        span { class: "bubble", "Salut" }
+                        span { class: "bubble mine", "Oui !" }
+                    }
+                    span { class: "shape-name", "{label}" }
+                }
+            }
+        }
+        div { class: "setting-label", "Couleur de mes bulles" }
+        ColorChoice { label: "Couleur de mes bulles", value: current.mine_color.clone(),
+            swatches: ACCENTS.to_vec(), fallback: accent_value.clone(),
+            on_pick: move |c: String| set(Box::new(move |l| l.mine_color = c)) }
+        div { class: "setting-label", "Couleur des bulles reçues" }
+        ColorChoice { label: "Couleur des bulles reçues", value: current.in_color.clone(),
+            swatches: IN_COLORS.to_vec(), fallback: "#ffffff".to_string(),
+            on_pick: move |c: String| set(Box::new(move |l| l.in_color = c)) }
+        div { class: "setting-label", "Police des messages" }
+        div { class: "fonts", role: "radiogroup",
+            button { role: "radio", aria_checked: "{current.font.is_empty()}",
+                class: crate::ui::pick(current.font.is_empty(), "font-opt on", "font-opt"),
+                onclick: move |_| set(Box::new(|l| l.font.clear())),
+                span { class: "font-sample", "Salut ! Ça va ?" }
+                span { class: "font-name", "Système" }
+            }
+            for f in proto::FONTS.iter().filter(|f| f.body) {
+                button { key: "{f.id}", role: "radio", aria_checked: "{current.font == f.id}",
+                    class: crate::ui::pick(current.font == f.id, "font-opt on", "font-opt"),
+                    onclick: { let id = f.id; move |_| set(Box::new(move |l| l.font = id.into())) },
+                    span { class: "font-sample font-{f.id}", "Salut ! Ça va ?" }
+                    span { class: "font-name", "{f.name}" }
+                }
+            }
+        }
         div { class: "setting-label", "Fond des discussions" }
         div { class: "walls",
             for (id, label) in WALLS {
@@ -190,6 +295,14 @@ pub fn Appearance() -> Element {
                 div { class: "hint", "Moins d'espace entre les messages et dans les listes." }
             }
             span { class: crate::ui::pick(current.compact, "switch on", "switch") }
+        }
+        button { class: "switch-row", role: "switch", aria_checked: "{reduced}",
+            onclick: move |_| set(Box::new(move |l| l.motion = if reduced { "auto".into() } else { "reduced".into() })),
+            div {
+                div { "Réduire les animations" }
+                div { class: "hint", "Moins de mouvements. Par défaut, le réglage de votre appareil est suivi." }
+            }
+            span { class: crate::ui::pick(reduced, "switch on", "switch") }
         }
     }
 }

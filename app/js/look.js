@@ -1,4 +1,5 @@
-// Appearance and sounds: theme presets applied as CSS variables on <html>,
+// Appearance and sounds: theme presets, bubble shape and colours, message font and
+// reduced motion, applied as CSS variables and data-* attributes on <html> (see look.css),
 // synthesized ring and message tones, and the goofysound ringtone.
 // Everything is per device, in localStorage. The theme is applied as soon as
 // this module loads, before the interface is first drawn.
@@ -49,8 +50,18 @@ const PRESETS = [
     d: ["#061411", "#0c1f1b", "#e5f7f2", "#88aaa2", "#183531", "#132b27"] },
 ];
 
-const DEFAULT_LOOK = { preset: "violet", mode: "auto", accent: "", bubble: "round", size: "m", wall: "none", compact: false };
+const DEFAULT_LOOK = {
+  preset: "violet", mode: "auto", accent: "", bubble: "round", size: "m", wall: "none", compact: false,
+  mineColor: "", inColor: "", font: "", motion: "auto",
+};
 const SIZES = { s: "14px", m: "16px", l: "18px", xl: "20px" };
+const BUBBLES = ["round", "square", "flat", "pill", "tail"];
+// Message fonts (the `body: true` entries of proto::FONTS) and their CSS families (fonts.css).
+const FONTS = {
+  inter: "GC Inter", nunito: "GC Nunito", atkinson: "GC Atkinson Hyperlegible", lora: "GC Lora",
+  "space-mono": "GC Space Mono", comfortaa: "GC Comfortaa", caveat: "GC Caveat",
+};
+const HEX = /^#[0-9a-f]{6}$/i;
 
 // ---- colour helpers ----
 function hexRgb(hex) {
@@ -68,6 +79,12 @@ function luminance(hex) {
     return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
   });
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+// Readable text colour on a solid background.
+function textOn(hex) { return luminance(hex) > 0.5 ? "#0b0b12" : "#ffffff"; }
+function contrast(a, b) {
+  const la = luminance(a), lb = luminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
 }
 function toHsl(hex) {
   let [r, g, b] = hexRgb(hex).map((v) => v / 255);
@@ -108,26 +125,37 @@ function variables(look) {
   const dark = isDark(look);
   const [bg, surface, text, muted, line, incoming] = dark ? preset.d : preset.l;
   let a = preset.a, b = preset.b, on = preset.on || "#ffffff";
-  if (/^#[0-9a-f]{6}$/i.test(look.accent || "")) {
+  if (HEX.test(look.accent || "")) {
     a = look.accent;
     const [h, s, l] = toHsl(a);
     b = fromHsl(h + 38, Math.min(1, s * 1.05 + 0.05), Math.min(0.72, l + 0.06));
-    on = luminance(a) > 0.5 ? "#0b0b12" : "#ffffff";
+    on = textOn(a);
   }
+  // Bubble colours: a custom colour is solid; the theme keeps the gradient.
+  const mineSolid = HEX.test(look.mineColor || "") ? look.mineColor : null;
+  const inSolid = HEX.test(look.inColor || "") ? look.inColor : null;
+  const font = Object.prototype.hasOwnProperty.call(FONTS, look.font) ? look.font : "";
   return {
     vars: {
-      "--bg": bg, "--surface": surface, "--text": text, "--muted": muted, "--line": line, "--in": incoming,
-      "--accent": a, "--accent-2": b, "--on-accent": on, "--mine-text": on,
-      "--bubble-mine": `linear-gradient(135deg, ${a}, ${b})`,
+      "--bg": bg, "--surface": surface, "--text": text, "--muted": muted, "--line": line, "--in": inSolid || incoming,
+      "--accent": a, "--accent-2": b, "--on-accent": on, "--mine-text": mineSolid ? textOn(mineSolid) : on,
+      "--bubble-mine": mineSolid || `linear-gradient(135deg, ${a}, ${b})`,
+      // Flat and tail shapes: a solid colour (the tail takes the end colour of the gradient).
+      "--mine-solid": mineSolid || a, "--mine-tail": mineSolid || b,
+      "--in-text": inSolid ? textOn(inSolid) : text,
+      "--in-flat": inSolid || "color-mix(in srgb, var(--line) 70%, var(--in))",
+      "--msg-font": font ? `"${FONTS[font]}", system-ui, sans-serif` : null,
       "--fs": SIZES[look.size] || SIZES.m,
       "--toast-bg": dark ? "#f2f2f7" : "#1d1d26", "--toast-fg": dark ? "#121218" : "#ffffff",
       "color-scheme": dark ? "dark" : "light",
     },
     attrs: {
       "data-theme": dark ? "dark" : "light",
-      "data-bubble": look.bubble || "round",
+      "data-bubble": BUBBLES.includes(look.bubble) ? look.bubble : "round",
       "data-wall": look.wall || "none",
       "data-compact": look.compact ? "1" : null,
+      "data-font": font || null,
+      "data-motion": look.motion === "reduced" ? "reduced" : null,
     },
     bg,
   };
@@ -136,7 +164,7 @@ function variables(look) {
 function applyLook(look) {
   const root = document.documentElement;
   const { vars, attrs, bg } = variables(look);
-  for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
+  for (const [k, v] of Object.entries(vars)) v == null ? root.style.removeProperty(k) : root.style.setProperty(k, v);
   for (const [k, v] of Object.entries(attrs)) v == null ? root.removeAttribute(k) : root.setAttribute(k, v);
   let meta = document.querySelector('meta[name="theme-color"]');
   if (!meta) {
@@ -164,6 +192,26 @@ export function lookPresets() {
     const [bg, surface, text, , , incoming] = dark ? p.d : p.l;
     return { id: p.id, name: p.name, a: p.a, b: p.b, on: p.on || "#ffffff", bg, surface, text, incoming };
   }));
+}
+
+/// A profile name colour (`#rrggbb`) made readable on the current theme: lightened (dark
+/// theme) or darkened (light theme), keeping its hue, until its contrast against the
+/// background and the surface colours is at least 3:1. "" or an invalid colour gives "".
+export function lookNameColor(color) {
+  if (!HEX.test(color || "")) return "";
+  const look = { ...DEFAULT_LOOK, ...read(THEME_KEY) };
+  const preset = PRESETS.find((p) => p.id === look.preset) || PRESETS[0];
+  const dark = isDark(look);
+  const [bg, surface] = dark ? preset.d : preset.l;
+  const readable = (c) => contrast(c, bg) >= 3 && contrast(c, surface) >= 3;
+  if (readable(color)) return color.toLowerCase();
+  const [h, s, l0] = toHsl(color);
+  for (let i = 1; i <= 50; i++) {
+    const l = Math.max(0, Math.min(1, l0 + (dark ? i : -i) * 0.02));
+    const c = fromHsl(h, s, l);
+    if (readable(c)) return c;
+  }
+  return dark ? "#ffffff" : "#000000";
 }
 
 applyLook({ ...DEFAULT_LOOK, ...read(THEME_KEY) });
@@ -376,4 +424,4 @@ export function messageSound() {
 }
 
 // Used by bridge.js for incoming calls.
-window.GoofyLook = { ring };
+window.GoofyLook = { ring, nameColor: lookNameColor };

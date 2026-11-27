@@ -2,12 +2,19 @@ mod account;
 mod api;
 mod auth;
 mod error;
+mod friends;
+mod imaging;
+mod internal;
 mod links;
 mod media;
+mod mentions;
 mod messages;
 mod music;
 mod photos;
+mod presence;
+mod profiles;
 mod state;
+mod stories;
 mod ws;
 
 #[cfg(test)]
@@ -34,6 +41,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     tokio::spawn(music::activity_loop(state.clone()));
+    tokio::spawn(stories::expire_loop(state.clone()));
+    if state.has_worker() {
+        // The stories worker's API, on its own port that compose never publishes.
+        let worker_addr: SocketAddr = state.config.worker_bind.parse()?;
+        let worker_listener = tokio::net::TcpListener::bind(worker_addr).await?;
+        let internal = api::internal_router(state.clone());
+        tracing::info!("worker API on {worker_addr}");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(worker_listener, internal).await {
+                tracing::error!("worker API: {e}");
+            }
+        });
+    } else {
+        tracing::info!("WORKER_TOKEN is empty: no video stories, archives stay uncompressed");
+    }
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr}");

@@ -54,25 +54,48 @@ fn too_many() -> Error {
     Error(StatusCode::TOO_MANY_REQUESTS, "Trop de tentatives, réessayez plus tard.".into())
 }
 
+/// The columns of a [`UserRow`], for a query where `users` is aliased `u`.
+pub const USER_COLS: &str =
+    "u.id, u.username, u.display_name, u.avatar, u.avatar_still, u.name_font, u.name_color";
+
 #[derive(sqlx::FromRow)]
 pub struct UserRow {
     id: i64,
     username: String,
     display_name: String,
     avatar: Option<String>,
+    avatar_still: Option<String>,
+    name_font: String,
+    name_color: String,
 }
 
 impl From<UserRow> for User {
     fn from(r: UserRow) -> Self {
-        User { id: r.id, username: r.username, display_name: r.display_name, avatar: r.avatar }
+        User {
+            id: r.id,
+            username: r.username,
+            display_name: r.display_name,
+            avatar: r.avatar,
+            avatar_still: r.avatar_still,
+            name_font: r.name_font,
+            name_color: r.name_color,
+        }
     }
 }
 
+pub async fn user_by_id(state: &AppState, id: i64) -> Result<Option<User>> {
+    let row: Option<UserRow> = sqlx::query_as(&format!("SELECT {USER_COLS} FROM users u WHERE u.id = ?"))
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+    Ok(row.map(Into::into))
+}
+
 pub async fn user_for_token(state: &AppState, token: &str) -> Result<User> {
-    let row: Option<UserRow> = sqlx::query_as(
-        "SELECT u.id, u.username, u.display_name, u.avatar FROM sessions s
-         JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.created_at > ?",
-    )
+    let row: Option<UserRow> = sqlx::query_as(&format!(
+        "SELECT {USER_COLS} FROM sessions s
+         JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.created_at > ?"
+    ))
     .bind(token_hash(token))
     .bind(now_ms() - SESSION_MS)
     .fetch_optional(&state.db)
@@ -174,7 +197,7 @@ pub async fn register(
         }
         Err(e) => return Err(e.into()),
     };
-    new_session(&state, User { id, username, display_name, avatar: None }).await
+    new_session(&state, User { id, username, display_name, avatar: None, ..Default::default() }).await
 }
 
 pub async fn login(
@@ -192,16 +215,17 @@ pub async fn login(
         return Err(too_many());
     }
     let wrong = || Error(StatusCode::UNAUTHORIZED, "Identifiant ou mot de passe incorrect.".into());
-    let row: Option<(i64, String, String, Option<String>)> =
-        sqlx::query_as("SELECT id, display_name, password_hash, avatar FROM users WHERE username = ?")
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT id, password_hash FROM users WHERE username = ?")
             .bind(&username)
             .fetch_optional(&state.db)
             .await?;
-    let (id, display_name, hash, avatar) = row.ok_or_else(wrong)?;
+    let (id, hash) = row.ok_or_else(wrong)?;
     if !check_password(&state, input.password, hash).await? {
         return Err(wrong());
     }
-    new_session(&state, User { id, username, display_name, avatar }).await
+    let user = user_by_id(&state, id).await?.ok_or_else(wrong)?;
+    new_session(&state, user).await
 }
 
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {

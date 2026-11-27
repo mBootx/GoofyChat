@@ -1,10 +1,10 @@
-//! Profile, blocked users and account deletion.
+//! Blocked users and account deletion (profiles are in `profiles.rs`).
 
 use crate::{
     api::member_ids,
-    auth::{check_password, Auth, UserRow},
+    auth::{check_password, Auth, UserRow, USER_COLS},
     error::{bad, not_found, Error, Result},
-    media,
+    friends, media,
     state::AppState,
 };
 use axum::{
@@ -16,7 +16,7 @@ use proto::*;
 use std::time::Duration;
 
 /// Asks everyone sharing these conversations to reload them.
-async fn announce(state: &AppState, conversations: &[i64]) -> Result<()> {
+pub async fn announce(state: &AppState, conversations: &[i64]) -> Result<()> {
     for &id in conversations {
         let members = member_ids(state, id).await?;
         state.send(&members, &ServerEvent::Conversation { id });
@@ -24,7 +24,7 @@ async fn announce(state: &AppState, conversations: &[i64]) -> Result<()> {
     Ok(())
 }
 
-async fn conversations_of(state: &AppState, user: i64) -> Result<Vec<i64>> {
+pub async fn conversations_of(state: &AppState, user: i64) -> Result<Vec<i64>> {
     let rows: Vec<(i64,)> = sqlx::query_as("SELECT conversation_id FROM members WHERE user_id = ?")
         .bind(user)
         .fetch_all(&state.db)
@@ -32,49 +32,11 @@ async fn conversations_of(state: &AppState, user: i64) -> Result<Vec<i64>> {
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
-pub async fn update_profile(
-    State(state): State<AppState>,
-    Auth(mut user): Auth,
-    Json(input): Json<Profile>,
-) -> Result<Json<User>> {
-    let display_name = input.display_name.trim().to_string();
-    if !(1..=40).contains(&display_name.chars().count()) {
-        return Err(bad("Nom affiché : 1 à 40 caractères."));
-    }
-    if !state.allow(user.id.to_string(), "profile", 20, Duration::from_secs(3600)) {
-        return Err(Error(StatusCode::TOO_MANY_REQUESTS, "Trop de changements, patientez.".into()));
-    }
-    let old = user.avatar.clone();
-    if input.remove_avatar {
-        user.avatar = None;
-    } else if let Some(id) = input.avatar_id {
-        sqlx::query("SELECT 1 FROM media WHERE id = ? AND owner_id = ? AND mime LIKE 'image/%'")
-            .bind(&id)
-            .bind(user.id)
-            .fetch_optional(&state.db)
-            .await?
-            .ok_or_else(|| bad("Choisissez une image."))?;
-        user.avatar = Some(id);
-    }
-    user.display_name = display_name;
-    sqlx::query("UPDATE users SET display_name = ?, avatar = ? WHERE id = ?")
-        .bind(&user.display_name)
-        .bind(&user.avatar)
-        .bind(user.id)
-        .execute(&state.db)
-        .await?;
-    if let Some(old) = old.filter(|old| user.avatar.as_ref() != Some(old)) {
-        media::discard(&state, &old).await?;
-    }
-    announce(&state, &conversations_of(&state, user.id).await?).await?;
-    Ok(Json(user))
-}
-
 pub async fn blocked(State(state): State<AppState>, Auth(user): Auth) -> Result<Json<Vec<User>>> {
-    let rows: Vec<UserRow> = sqlx::query_as(
-        "SELECT u.id, u.username, u.display_name, u.avatar FROM blocks b
-         JOIN users u ON u.id = b.blocked_id WHERE b.user_id = ? ORDER BY u.username",
-    )
+    let rows: Vec<UserRow> = sqlx::query_as(&format!(
+        "SELECT {USER_COLS} FROM blocks b
+         JOIN users u ON u.id = b.blocked_id WHERE b.user_id = ? ORDER BY u.username"
+    ))
     .bind(user.id)
     .fetch_all(&state.db)
     .await?;
@@ -105,9 +67,12 @@ pub async fn block(
         .execute(&state.db)
         .await?;
     // Stop a call that is currently ringing between the two.
-    state.calls.lock().unwrap().retain(|_, c| {
-        !((c.from.id == id && c.to == user.id) || (c.from.id == user.id && c.to == id))
-    });
+    friends::end_calls(&state, user.id, id);
+    // Blocking ends the friendship and any pending request, both ways.
+    if friends::separate(&state, user.id, id).await? {
+        state.send(&[user.id, id], &ServerEvent::Friends { notice: None });
+        friends::announce_direct(&state, user.id, id).await?;
+    }
     refresh_own(&state, user.id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -147,6 +112,15 @@ pub async fn delete_account(
     }
 
     let conversations = conversations_of(&state, user.id).await?;
+    // Friends and people with a pending request reload their lists afterwards.
+    let close: Vec<(i64,)> = sqlx::query_as(
+        "SELECT CASE WHEN user_a = ?1 THEN user_b ELSE user_a END FROM friendships WHERE user_a = ?1 OR user_b = ?1
+         UNION SELECT to_id FROM friend_requests WHERE from_id = ?1
+         UNION SELECT from_id FROM friend_requests WHERE to_id = ?1",
+    )
+    .bind(user.id)
+    .fetch_all(&state.db)
+    .await?;
     let mut others = Vec::new();
     for &id in &conversations {
         others.push((id, member_ids(&state, id).await?));
@@ -193,6 +167,9 @@ pub async fn delete_account(
     crate::music::forget_activity(&state, user.id).await;
     // Dropping the senders closes the sockets.
     state.sockets.lock().unwrap().remove(&user.id);
+    crate::presence::forget(&state, user.id);
+    let close: Vec<i64> = close.into_iter().map(|r| r.0).collect();
+    state.send(&close, &ServerEvent::Friends { notice: None });
     for (id, mut members) in others {
         members.retain(|&m| m != user.id);
         state.send(&members, &ServerEvent::Conversation { id });

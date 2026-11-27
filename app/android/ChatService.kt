@@ -64,6 +64,9 @@ class ChatService : Service() {
         manager.createNotificationChannel(
             NotificationChannel("messages", "Messages", NotificationManager.IMPORTANCE_HIGH)
         )
+        manager.createNotificationChannel(
+            NotificationChannel("mentions", "Mentions", NotificationManager.IMPORTANCE_HIGH)
+        )
         val calls = NotificationChannel("calls", "Appels", NotificationManager.IMPORTANCE_HIGH)
         calls.setSound(
             RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
@@ -102,7 +105,10 @@ class ChatService : Service() {
                 types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 if (videoCall) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
             }
-            startForeground(STATUS_ID, status, types)
+            runCatching { startForeground(STATUS_ID, status, types) }.onFailure {
+                val fallback = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+                startForeground(STATUS_ID, status, fallback)
+            }
         } else {
             startForeground(STATUS_ID, status)
         }
@@ -166,20 +172,47 @@ class ChatService : Service() {
 
     private fun handle(event: JSONObject) {
         val me = getSharedPreferences(PREFS, MODE_PRIVATE).getString("userId", "")
-        when (event.getString("type")) {
+        when (event.optString("type")) {
             "message" -> {
                 val message = event.getJSONObject("message")
                 val sender = message.getJSONObject("sender")
                 if (MainActivity.visible || sender.getString("id") == me) return
-                val body = message.getString("body").ifEmpty { "Pièce jointe" }
-                val notification = Notification.Builder(this, "messages")
+                val senderName = sender.getString("display_name")
+                val body = message.optString("body").ifEmpty { "Pièce jointe" }
+                val myId = me?.toLongOrNull()
+                val mentions = message.optJSONArray("mentions")
+                val mentioned = myId != null && mentions != null &&
+                    (0 until mentions.length()).any { mentions.optLong(it, -1L) == myId }
+                val channel = if (mentioned) "mentions" else "messages"
+                val title = if (mentioned) "$senderName vous a mentionné" else senderName
+                val notification = Notification.Builder(this, channel)
                     .setSmallIcon(android.R.drawable.stat_notify_chat)
-                    .setContentTitle(sender.getString("display_name"))
+                    .setContentTitle(title)
                     .setContentText(body)
                     .setContentIntent(openApp())
                     .setAutoCancel(true)
                     .build()
-                manager.notify(1000 + message.getInt("conversation_id"), notification)
+                val conversationId = message.getInt("conversation_id")
+                if (mentioned) {
+                    manager.notify("mention", conversationId, notification)
+                } else {
+                    manager.notify(1000 + conversationId, notification)
+                }
+            }
+            "friends" -> {
+                if (MainActivity.visible) return
+                val notice = event.optJSONObject("notice") ?: return
+                if (notice.optString("kind") != "request") return
+                val user = notice.optJSONObject("user") ?: return
+                val name = user.optString("display_name").ifEmpty { return }
+                val notification = Notification.Builder(this, "messages")
+                    .setSmallIcon(android.R.drawable.stat_notify_chat)
+                    .setContentTitle("Demande d'ami")
+                    .setContentText("$name veut devenir votre ami.")
+                    .setContentIntent(openApp())
+                    .setAutoCancel(true)
+                    .build()
+                manager.notify("friend", user.optInt("id"), notification)
             }
             "call" -> {
                 val from = event.getJSONObject("from")

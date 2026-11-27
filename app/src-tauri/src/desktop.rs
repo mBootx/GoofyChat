@@ -433,7 +433,12 @@ fn allow_media(window: &WebviewWindow) {
             settings.set_media_playback_requires_user_gesture(false);
         }
         view.connect_permission_request(|view, request| {
-            let own = view.uri().is_some_and(|uri| uri.starts_with("tauri://localhost"));
+            let own = view.uri().is_some_and(|uri| {
+                uri.starts_with("tauri://localhost")
+                    || uri.starts_with("http://tauri.localhost")
+                    || uri.starts_with("https://tauri.localhost")
+            });
+            // Covers microphone, camera and display capture requests on WebKitGTK.
             if own && request.downcast_ref::<UserMediaPermissionRequest>().is_some() {
                 request.allow();
                 return true;

@@ -1,15 +1,15 @@
 //! What friends are listening to on goofysound, "like Discord": the state kept in
-//! `Ctx::activities`, status lines for lists and headers, and the desktop pane.
+//! `Ctx::activities`, status lines for lists and headers; the Activity page (mobile tab)
+//! and the desktop right pane (contract 0.4.0 §7.3, §7.4).
 
 use crate::{
-    api, music,
-    screens,
-    ui::{Avatar, Icon},
+    api, music, profile, screens, stories,
+    ui::{Icon, Name, UserAvatar},
     Ctx, Screen,
 };
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
-use proto::{Activity, Conversation, NewConversation, Track, User};
+use proto::{Activity, Conversation, Track, User};
 
 /// Initial state, on (re)connection.
 pub async fn load(mut ctx: Ctx) {
@@ -53,34 +53,8 @@ pub fn line(track: &Track) -> String {
     }
 }
 
-/// A member known from the conversations.
-fn person(ctx: Ctx, id: i64) -> Option<User> {
-    ctx.conversations.read().iter().flat_map(|c| c.members.iter()).find(|u| u.id == id).cloned()
-}
-
-/// Opens the one-to-one conversation with this member, creating it when needed.
-fn open_with(ctx: Ctx, user: i64) {
-    let me = ctx.my_id();
-    let existing = ctx
-        .conversations
-        .peek()
-        .iter()
-        .find(|c| !c.is_group && c.members.len() == 2 && c.members.iter().any(|u| u.id == user) && c.members.iter().any(|u| u.id == me))
-        .map(|c| c.id);
-    match existing {
-        Some(id) => ctx.open(Screen::Chat(id)),
-        None => {
-            spawn(screens::start_conversation(ctx, NewConversation { member_ids: vec![user], name: None }));
-        }
-    }
-}
-
-/// Third column of the wide layout. Hidden by CSS on narrower windows.
-#[component]
-pub fn ActivityPane() -> Element {
-    let ctx = use_context::<Ctx>();
-    let me = ctx.my_id();
-    let mut collapsed = use_signal(|| music::pref("activity.collapsed") == "1");
+/// The current time, refreshed every second (listening progress bars).
+fn use_clock() -> Signal<f64> {
     let mut now = use_signal(js_sys::Date::now);
     use_hook(move || {
         spawn(async move {
@@ -90,64 +64,170 @@ pub fn ActivityPane() -> Element {
             }
         });
     });
+    now
+}
 
-    let mut list: Vec<Activity> = ctx.activities.read().iter().filter(|a| a.user_id != me).cloned().collect();
-    list.sort_by(|a, b| b.since.cmp(&a.since));
-    let entries: Vec<(Activity, User)> = list
-        .into_iter()
-        .filter_map(|a| {
-            let user = person(ctx, a.user_id)?;
-            Some((a, user))
-        })
-        .collect();
-    let count = entries.len();
-    let toggle = move |_| {
-        let value = !collapsed();
-        collapsed.set(value);
-        music::set_pref("activity.collapsed", if value { "1" } else { "" });
+/// The "Activité" tab of the mobile home.
+#[component]
+pub fn ActivityPage() -> Element {
+    rsx! {
+        div { class: "screen activity-page",
+            header { h2 { "Activité" } }
+            div { class: "list activity-feed-wrap",
+                ActivityFeed {}
+            }
+        }
+    }
+}
+
+/// Right pane of the wide layout (shown while `Ctx::side_open`): the profile of the other
+/// person of a one-to-one conversation, the members of a group, else the activity.
+#[component]
+pub fn SidePane() -> Element {
+    let ctx = use_context::<Ctx>();
+    let me = ctx.my_id();
+    let open = match *ctx.screen.read() {
+        Screen::Chat(id) => Some(id),
+        _ => None,
     };
+    let conversation = open.and_then(|id| ctx.conversations.read().iter().find(|c| c.id == id).cloned());
+    let content = match conversation {
+        Some(c) if c.is_group => rsx! { MembersPane { conversation: c } },
+        Some(c) => match screens::peer(&c, me) {
+            Some(user) => rsx! { profile::ProfilePane { key: "{user.id}", user_id: user.id } },
+            None => rsx! { ActivityPane {} },
+        },
+        None => rsx! { ActivityPane {} },
+    };
+    rsx! {
+        aside { class: "right-pane",
+            button { class: "icon pane-close", title: "Masquer le panneau", onclick: move |_| ctx.set_side_open(false),
+                Icon { name: "hangup" }
+            }
+            {content}
+        }
+    }
+}
 
-    if collapsed() {
-        return rsx! {
-            aside { class: "activity-pane collapsed",
-                button { class: "icon activity-toggle", title: "Afficher l'activité", onclick: toggle,
-                    span { class: "flip", Icon { name: "chevron" } }
-                }
-                div { class: "activity-rail",
-                    if count == 0 {
-                        div { class: "rail-empty", title: "Personne n'écoute de musique", Icon { name: "music" } }
-                    }
-                    for (activity, user) in entries {
-                        button { key: "{user.id}", class: "rail-person",
-                            title: "{user.display_name} · {line(&activity.track)}",
-                            onclick: { let id = user.id; move |_| open_with(ctx, id) },
-                            Avatar { name: user.display_name.clone(), photo: user.avatar.clone(), small: true, live: true }
+/// Members of the open group, online ones first; tap opens a profile.
+#[component]
+fn MembersPane(conversation: Conversation) -> Element {
+    let ctx = use_context::<Ctx>();
+    let me = ctx.my_id();
+    let mut members = conversation.members.clone();
+    let online: Vec<i64> = members.iter().filter(|u| u.id == me || ctx.is_online(u.id)).map(|u| u.id).collect();
+    members.sort_by_key(|u| (!online.contains(&u.id), u.display_name.to_lowercase()));
+    rsx! {
+        div { class: "pane-head",
+            h3 { "Membres — {members.len()}" }
+        }
+        div { class: "pane-list",
+            for u in members {
+                {
+                    let id = u.id;
+                    let live = track_of(ctx, id).is_some();
+                    rsx! {
+                        button { key: "{id}", class: "row pane-person", onclick: move |_| ctx.open(Screen::Profile(id)),
+                            UserAvatar { user: u.clone(), small: true, online: online.contains(&id), live }
+                            div { class: "main",
+                                div { class: "title", Name { user: u.clone() } }
+                                if let Some(t) = track_of(ctx, id) {
+                                    div { class: "listening", "{line(&t)}" }
+                                } else {
+                                    div { class: "sub", "@{u.username}" }
+                                }
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// The activity in the desktop right pane.
+#[component]
+pub fn ActivityPane() -> Element {
+    rsx! {
+        div { class: "pane-head", h3 { "Activité" } }
+        div { class: "pane-list activity-feed-wrap",
+            ActivityFeed {}
+        }
+    }
+}
+
+/// Friends only: who is online, what they listen to, their recent stories.
+#[component]
+fn ActivityFeed() -> Element {
+    let ctx = use_context::<Ctx>();
+    let me = ctx.my_id();
+    let now = use_clock();
+    let friends = ctx.friends.read().clone();
+    let online: Vec<User> = friends.iter().filter(|f| ctx.is_online(f.user.id)).map(|f| f.user.clone()).collect();
+    let mut listening: Vec<Activity> = ctx
+        .activities
+        .read()
+        .iter()
+        .filter(|a| a.user_id != me && friends.iter().any(|f| f.user.id == a.user_id))
+        .cloned()
+        .collect();
+    listening.sort_by(|a, b| b.since.cmp(&a.since));
+    let entries: Vec<(Activity, User)> = listening
+        .into_iter()
+        .filter_map(|a| {
+            let user = friends.iter().find(|f| f.user.id == a.user_id)?.user.clone();
+            Some((a, user))
+        })
+        .collect();
+    let stories = ctx
+        .stories
+        .read()
+        .iter()
+        .any(|r| r.user.id != me && r.stories.iter().any(|s| s.state == proto::StoryState::Live));
+
+    if online.is_empty() && entries.is_empty() && !stories {
+        return rsx! {
+            div { class: "activity-empty",
+                div { class: "note-art", Icon { name: "activity" } }
+                p { "C'est calme ici — quand vos amis sont en ligne, écoutent de la musique ou publient une story, ça s'affiche ici." }
+            }
         };
     }
-
     rsx! {
-        aside { class: "activity-pane",
-            div { class: "activity-head",
-                h3 { "Activité" }
-                if count > 0 {
-                    span { class: "activity-count", "{count}" }
-                }
-                button { class: "icon activity-toggle", title: "Masquer l'activité", onclick: toggle, Icon { name: "chevron" } }
-            }
-            div { class: "activity-list",
-                if count == 0 {
-                    div { class: "activity-empty",
-                        div { class: "note-art", Icon { name: "music" } }
-                        b { "C'est calme ici" }
-                        p { "Quand vos amis écoutent de la musique sur goofysound, ça s'affiche ici." }
+        div { class: "activity-feed",
+            if !online.is_empty() {
+                section { class: "feed-section",
+                    h3 { class: "section-title", "En ligne — {online.len()}" }
+                    div { class: "online-strip",
+                        for u in online {
+                            {
+                                let id = u.id;
+                                rsx! {
+                                    button { key: "{id}", class: "online-friend", title: "{u.display_name}",
+                                        onclick: move |_| ctx.open(Screen::Profile(id)),
+                                        UserAvatar { user: u.clone(), online: true, live: track_of(ctx, id).is_some() }
+                                        span { class: "online-name", Name { user: u.clone() } }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                for (activity, user) in entries {
-                    ActivityCard { key: "{user.id}", activity, user, now: now() }
+            }
+            if !entries.is_empty() {
+                section { class: "feed-section",
+                    h3 { class: "section-title", "En écoute — {entries.len()}" }
+                    div { class: "activity-list",
+                        for (activity, user) in entries {
+                            ActivityCard { key: "{user.id}", activity, user, now: now() }
+                        }
+                    }
+                }
+            }
+            if stories {
+                section { class: "feed-section",
+                    h3 { class: "section-title", "Stories récentes" }
+                    stories::RecentStories {}
                 }
             }
         }
@@ -175,10 +255,10 @@ fn ActivityCard(activity: Activity, user: User, now: f64) -> Element {
     };
     rsx! {
         div { class: "activity-card",
-            button { class: "activity-who", title: "Écrire à {user.display_name}", onclick: move |_| open_with(ctx, user_id),
-                Avatar { name: user.display_name.clone(), photo: user.avatar.clone(), small: true, live: true }
+            button { class: "activity-who", title: "Profil de {user.display_name}", onclick: move |_| ctx.open(Screen::Profile(user_id)),
+                UserAvatar { user: user.clone(), small: true, live: true }
                 div { class: "activity-name",
-                    b { "{user.display_name}" }
+                    b { Name { user: user.clone() } }
                     span { "sur {activity.player}" }
                 }
                 music::Eq {}

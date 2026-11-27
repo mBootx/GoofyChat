@@ -1,8 +1,8 @@
 //! Sign up and in, conversation list and new conversation.
 
 use crate::{
-    activity, api, js,
-    ui::{self, Avatar, Icon},
+    activity, api, chat, js,
+    ui::{self, Avatar, Icon, Name, UserAvatar},
     Ctx, Screen,
 };
 use dioxus::prelude::*;
@@ -96,14 +96,6 @@ pub fn title(conversation: &Conversation, me: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Profile photo of the other person in a one-to-one conversation.
-pub fn photo(conversation: &Conversation, me: i64) -> Option<String> {
-    if conversation.is_group {
-        return None;
-    }
-    conversation.members.iter().find(|u| u.id != me).and_then(|u| u.avatar.clone())
-}
-
 fn preview(c: &Conversation) -> String {
     match &c.last_message {
         None => "Aucun message".into(),
@@ -111,82 +103,113 @@ fn preview(c: &Conversation) -> String {
     }
 }
 
+/// The other person of a one-to-one conversation.
+pub fn peer(conversation: &Conversation, me: i64) -> Option<User> {
+    if conversation.is_group {
+        return None;
+    }
+    conversation.members.iter().find(|u| u.id != me).cloned()
+}
+
+/// The "Messages" tab of the mobile home: the conversation list, the friends button and
+/// the "+" button.
 #[component]
-pub fn Home() -> Element {
+pub fn Conversations() -> Element {
     let ctx = use_context::<Ctx>();
-    let me = ctx.my_id();
-    let name = ctx.session.read().as_ref().map(|s| s.user.display_name.clone()).unwrap_or_default();
-    let username = ctx.session.read().as_ref().map(|s| s.user.username.clone()).unwrap_or_default();
-    let avatar = ctx.session.read().as_ref().and_then(|s| s.user.avatar.clone());
+    let requests = ctx.requests.read().incoming.len();
+    rsx! {
+        div { class: "screen conversations-screen",
+            header {
+                h2 { "Messages" }
+                button { class: "icon with-badge", title: "Amis", onclick: move |_| ctx.open(Screen::Friends),
+                    Icon { name: "userplus" }
+                    if requests > 0 {
+                        span { class: "badge", "{requests}" }
+                    }
+                }
+            }
+            ConversationList {}
+            button { class: "fab", title: "Nouvelle discussion", onclick: move |_| ctx.open(Screen::New), Icon { name: "plus" } }
+        }
+    }
+}
+
+/// The conversations, newest first (mobile Messages tab and desktop side navigation).
+#[component]
+pub fn ConversationList() -> Element {
+    let ctx = use_context::<Ctx>();
     let conversations = ctx.conversations.read().clone();
-    let mut people = ctx.people_tab;
-    let unread: i64 = conversations.iter().map(|c| c.unread).sum();
-    let wide = *ctx.wide.read();
     let open = match *ctx.screen.read() {
         Screen::Chat(id) => Some(id),
         _ => None,
     };
     let hint = if ctx.desktop {
-        "Aucune discussion. Cliquez sur + ou trouvez vos amis dans Personnes."
+        "Aucune discussion. Cliquez sur + pour écrire à un ami."
     } else {
-        "Aucune discussion. Touchez + ou trouvez vos amis dans Personnes."
+        "Aucune discussion. Touchez + pour écrire à un ami."
     };
-
     rsx! {
-        div { class: "screen",
-            header {
-                Avatar { name: name.clone(), photo: avatar, small: true }
-                h2 { if people() { "Personnes" } else { "Discussions" } small { "@{username}" } }
-                if wide {
-                    button { class: "icon", title: "Nouvelle discussion", onclick: move |_| ctx.open(Screen::New),
-                        Icon { name: "plus" } }
+        div { class: "list conversations",
+            if conversations.is_empty() {
+                div { class: "empty",
+                    p { "{hint}" }
+                    button { class: "ghost", onclick: move |_| ctx.open(Screen::Friends), "Ajouter des amis" }
                 }
-                button { class: "icon", title: "Réglages", onclick: move |_| ctx.open(Screen::Settings), Icon { name: "settings" } }
             }
-            if people() {
-                People {}
+            for c in conversations {
+                ConversationRow { key: "{c.id}", active: open == Some(c.id), conversation: c }
+            }
+        }
+    }
+}
+
+#[component]
+fn ConversationRow(conversation: Conversation, active: bool) -> Element {
+    let ctx = use_context::<Ctx>();
+    let me = ctx.my_id();
+    let c = conversation;
+    let id = c.id;
+    let other = peer(&c, me);
+    let track = activity::peer_track(ctx, &c, me);
+    let online = other.as_ref().is_some_and(|u| ctx.is_online(u.id));
+    let status = if c.locked { None } else { chat::row_status(&c, me) };
+    let mut class = String::from("row");
+    if active {
+        class.push_str(" active");
+    }
+    if c.unread > 0 {
+        class.push_str(" unread");
+    }
+    rsx! {
+        button { class, onclick: move |_| ctx.open(Screen::Chat(id)),
+            if let Some(user) = other.clone() {
+                UserAvatar { user, live: track.is_some(), online }
             } else {
-            div { class: "list",
-                if conversations.is_empty() {
-                    div { class: "empty", "{hint}" }
-                }
-                for c in conversations {
-                    button { key: "{c.id}", class: if open == Some(c.id) { "row active" } else { "row" },
-                        onclick: move |_| ctx.open(Screen::Chat(c.id)),
-                        Avatar { name: title(&c, me), photo: photo(&c, me), live: activity::peer_track(ctx, &c, me).is_some() }
-                        div { class: "main",
-                            div { class: "title", "{title(&c, me)}" }
-                            div { class: "sub", "{preview(&c)}" }
-                            if let Some(t) = activity::peer_track(ctx, &c, me) {
-                                div { class: "listening", "{activity::line(&t)}" }
-                            }
-                        }
-                        div { class: "side",
-                            if let Some(m) = &c.last_message {
-                                span { "{ui::short(m.created_at)}" }
-                            }
-                            if c.unread > 0 {
-                                span { class: "badge", "{c.unread}" }
-                            }
-                        }
+                Avatar { name: c.name.clone() }
+            }
+            div { class: "main",
+                div { class: "title",
+                    if let Some(user) = other {
+                        Name { user }
+                    } else {
+                        "{c.name}"
                     }
                 }
-            }
-            if !wide {
-                button { class: "fab", onclick: move |_| ctx.open(Screen::New), Icon { name: "plus" } }
-            }
-            }
-            nav { class: "tabs",
-                button { class: if people() { "tab" } else { "tab on" }, onclick: move |_| people.set(false),
-                    Icon { name: "chat" }
-                    span { "Discussions" }
-                    if unread > 0 {
-                        span { class: "badge", "{unread}" }
-                    }
+                div { class: "sub", "{preview(&c)}" }
+                if let Some(t) = &track {
+                    div { class: "listening", "{activity::line(t)}" }
                 }
-                button { class: if people() { "tab on" } else { "tab" }, onclick: move |_| people.set(true),
-                    Icon { name: "users" }
-                    span { "Personnes" }
+            }
+            div { class: "side",
+                if c.locked {
+                    span { class: "row-lock", title: "Vous n'êtes plus amis", Icon { name: "lock" } }
+                } else if let Some(s) = status {
+                    span { class: "row-status", "{s}" }
+                } else if let Some(m) = &c.last_message {
+                    span { "{ui::short(m.created_at)}" }
+                }
+                if c.unread > 0 {
+                    span { class: "badge", "{c.unread}" }
                 }
             }
         }
@@ -208,120 +231,64 @@ pub(crate) async fn start_conversation(ctx: Ctx, body: NewConversation) {
     }
 }
 
-/// Every member, to find friends.
-#[component]
-fn People() -> Element {
-    let ctx = use_context::<Ctx>();
-    let mut query = use_signal(String::new);
-    let mut users = use_signal(|| None::<Vec<User>>);
-    let mut busy = use_signal(|| false);
-
-    let load = move |q: String| {
-        spawn(async move {
-            let encoded = String::from(js_sys::encode_uri_component(&q));
-            match api::get::<Vec<User>>(&ctx.token(), &format!("/api/users?q={encoded}")).await {
-                // Ignore answers to an outdated query.
-                Ok(list) if *query.peek() == q => users.set(Some(list)),
-                Ok(_) => {}
-                Err(e) => ctx.fail(e),
-            }
-        });
-    };
-    use_hook(move || load(String::new()));
-
-    rsx! {
-        div { class: "pad",
-            input { class: "field", placeholder: "Rechercher une personne…", autocapitalize: "none", value: "{query}",
-                oninput: move |e| {
-                    let q = e.value();
-                    query.set(q.clone());
-                    load(q.trim().to_string());
-                },
-            }
-        }
-        div { class: "list",
-            if let Some(list) = users() {
-                if list.is_empty() {
-                    div { class: "empty", "Aucune personne trouvée." }
-                }
-                for u in list.clone() {
-                    button { key: "{u.id}", class: "row", disabled: busy(),
-                        onclick: {
-                            let id = u.id;
-                            move |_| {
-                                busy.set(true);
-                                spawn(async move {
-                                    let body = NewConversation { member_ids: vec![id], name: None };
-                                    start_conversation(ctx, body).await;
-                                    if let Ok(mut b) = busy.try_write() {
-                                        *b = false;
-                                    }
-                                });
-                            }
-                        },
-                        Avatar { name: u.display_name.clone(), photo: u.avatar.clone(), live: activity::track_of(ctx, u.id).is_some() }
-                        div { class: "main",
-                            div { class: "title", "{u.display_name}" }
-                            div { class: "sub", "@{u.username}" }
-                            if let Some(t) = activity::track_of(ctx, u.id) {
-                                div { class: "listening", "{activity::line(&t)}" }
-                            }
-                        }
-                    }
-                }
-            } else {
-                div { class: "empty", "Chargement…" }
-            }
-        }
-    }
+fn matches(user: &User, query: &str) -> bool {
+    let q = query.trim().trim_start_matches('@').to_lowercase();
+    q.is_empty() || user.username.to_lowercase().contains(&q) || user.display_name.to_lowercase().contains(&q)
 }
 
+/// A new conversation with one friend, or a group of friends (a name when two or more).
 #[component]
 pub fn NewChat() -> Element {
     let ctx = use_context::<Ctx>();
-    let mut results = use_signal(Vec::<User>::new);
     let mut chosen = use_signal(Vec::<User>::new);
     let mut group = use_signal(String::new);
     let mut query = use_signal(String::new);
+    let mut busy = use_signal(|| false);
     // A keyboard is at hand on desktop; on a phone it would cover the screen.
     use_hook(move || {
         if ctx.desktop {
             js::focus_input("new-search");
         }
     });
-
-    let search = move |event: FormEvent| {
-        let q = event.value();
-        query.set(q.clone());
-        spawn(async move {
-            let encoded = String::from(js_sys::encode_uri_component(&q));
-            if let Ok(list) = api::get(&ctx.token(), &format!("/api/users?q={encoded}")).await {
-                // Ignore answers to an outdated query.
-                if *query.peek() == q {
-                    results.set(list);
-                }
-            }
-        });
-    };
+    let friends: Vec<User> = ctx.friends.read().iter().map(|f| f.user.clone()).collect();
+    let no_friends = friends.is_empty();
+    let shown: Vec<User> = friends.into_iter().filter(|u| matches(u, &query())).collect();
+    let count = chosen.read().len();
 
     let create = move |_| {
-        let is_group = chosen.read().len() > 1;
-        let body = NewConversation {
-            member_ids: chosen.read().iter().map(|u| u.id).collect(),
-            name: is_group.then(|| group()),
-        };
-        spawn(start_conversation(ctx, body));
+        if busy() {
+            return;
+        }
+        let ids: Vec<i64> = chosen.read().iter().map(|u| u.id).collect();
+        if ids.len() == 1 {
+            crate::friends::open_direct(ctx, ids[0]);
+            return;
+        }
+        let name = group().trim().to_string();
+        if name.is_empty() {
+            ctx.notify("Donnez un nom au groupe.");
+            return;
+        }
+        busy.set(true);
+        let body = NewConversation { member_ids: ids, name: Some(name) };
+        spawn(async move {
+            start_conversation(ctx, body).await;
+            if let Ok(mut b) = busy.try_write() {
+                *b = false;
+            }
+        });
     };
 
     rsx! {
         div { class: "screen",
             header {
-                button { class: "icon", onclick: move |_| js::pop_screen(), Icon { name: "back" } }
-                h2 { "Nouvelle discussion" }
+                button { class: "icon", title: "Retour", onclick: move |_| ctx.back(), Icon { name: "back" } }
+                h2 { "Nouvelle discussion" small { "Avec vos amis" } }
             }
             div { class: "pad",
-                input { id: "new-search", class: "field", placeholder: "Rechercher un identifiant…", autocapitalize: "none", oninput: search }
-                if !chosen.read().is_empty() {
+                input { id: "new-search", class: "field", placeholder: "Rechercher un ami…", autocapitalize: "none",
+                    value: "{query}", oninput: move |e| query.set(e.value()) }
+                if count > 0 {
                     div { class: "chips",
                         for u in chosen() {
                             button { key: "{u.id}", class: "chip",
@@ -331,31 +298,48 @@ pub fn NewChat() -> Element {
                         }
                     }
                 }
-                if chosen.read().len() > 1 {
+                if count > 1 {
                     input { class: "field", placeholder: "Nom du groupe", value: "{group}",
                         oninput: move |e| group.set(e.value()) }
                 }
-                if !chosen.read().is_empty() {
-                    button { class: "primary", onclick: create,
-                        if chosen.read().len() > 1 { "Créer le groupe" } else { "Discuter" }
+                if count > 0 {
+                    button { class: "primary", disabled: busy(), onclick: create,
+                        if count > 1 { "Créer le groupe" } else { "Discuter" }
                     }
                 }
             }
             div { class: "list",
-                for u in results() {
-                    button { key: "{u.id}", class: "row",
-                        onclick: {
-                            let u = u.clone();
-                            move |_| {
-                                if !chosen.read().iter().any(|x| x.id == u.id) {
-                                    chosen.write().push(u.clone());
+                if no_friends {
+                    div { class: "empty",
+                        p { "Vous ne pouvez écrire qu'à vos amis. Ajoutez-en avec leur identifiant." }
+                        button { class: "ghost", onclick: move |_| ctx.open(Screen::Friends), "Ajouter des amis" }
+                    }
+                } else if shown.is_empty() {
+                    div { class: "empty", "Aucun ami trouvé." }
+                }
+                for u in shown {
+                    {
+                        let picked = chosen.read().iter().any(|x| x.id == u.id);
+                        let online = ctx.is_online(u.id);
+                        rsx! {
+                            button { key: "{u.id}", class: if picked { "row picked" } else { "row" },
+                                onclick: {
+                                    let u = u.clone();
+                                    move |_| {
+                                        if chosen.read().iter().any(|x| x.id == u.id) {
+                                            chosen.write().retain(|x| x.id != u.id);
+                                        } else {
+                                            chosen.write().push(u.clone());
+                                        }
+                                    }
+                                },
+                                UserAvatar { user: u.clone(), online }
+                                div { class: "main",
+                                    div { class: "title", Name { user: u.clone() } }
+                                    div { class: "sub", "@{u.username}" }
                                 }
+                                span { class: if picked { "pick on" } else { "pick" }, Icon { name: "check" } }
                             }
-                        },
-                        Avatar { name: u.display_name.clone(), photo: u.avatar.clone() }
-                        div { class: "main",
-                            div { class: "title", "{u.display_name}" }
-                            div { class: "sub", "@{u.username}" }
                         }
                     }
                 }

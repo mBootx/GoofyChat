@@ -1,6 +1,7 @@
 use crate::{
     api::{is_blocked, member_ids},
     auth::user_for_token,
+    friends, presence,
     state::{AppState, PendingCall, RING_TIMEOUT},
 };
 use axum::{
@@ -77,6 +78,8 @@ async fn run(state: AppState, mut socket: WebSocket) {
     // The map now holds the only sender: removing it there closes this socket.
     drop(tx);
 
+    // Counts towards presence from `active: true` until `active: false` or close.
+    let mut active = false;
     // Neither deadline is reset by outgoing events.
     let mut deadline = tokio::time::Instant::now() + SILENCE;
     let mut recheck = tokio::time::interval(Duration::from_secs(30));
@@ -99,7 +102,19 @@ async fn run(state: AppState, mut socket: WebSocket) {
                     Some(ClientEvent::Ping) => {
                         if !push(&mut socket, &ServerEvent::Pong).await { break }
                     }
-                    Some(ClientEvent::Call { signal }) => relay(&state, &user, signal).await,
+                    Some(ClientEvent::Call { signal }) => {
+                        if call_allowed(&state, user.id, &signal).await {
+                            relay(&state, &user, signal).await
+                        }
+                    }
+                    Some(ClientEvent::Active { active: now }) => {
+                        if now && !active {
+                            presence::activate(&state, user.id).await;
+                        } else if !now && active {
+                            presence::deactivate(&state, user.id);
+                        }
+                        active = now;
+                    }
                     Some(ClientEvent::Typing { conversation_id }) => {
                         typing(&state, user.id, conversation_id).await
                     }
@@ -111,6 +126,30 @@ async fn run(state: AppState, mut socket: WebSocket) {
     drop(rx);
     if let Some(list) = state.sockets.lock().unwrap().get_mut(&user.id) {
         list.retain(|t| !t.is_closed());
+    }
+    if active {
+        presence::deactivate(&state, user.id);
+    }
+}
+
+/// Calls in a one-to-one conversation need the two to be friends: a locked conversation
+/// relays nothing, except the signals that end a call already under way.
+pub async fn call_allowed(state: &AppState, from: i64, signal: &CallSignal) -> bool {
+    if matches!(signal.action, CallAction::Hangup | CallAction::Reject) {
+        return true;
+    }
+    let found: Result<Option<(bool,)>, _> = sqlx::query_as("SELECT is_group FROM conversations WHERE id = ?")
+        .bind(signal.conversation_id)
+        .fetch_optional(&state.db)
+        .await;
+    let Ok(Some((is_group,))) = found else { return false };
+    if is_group {
+        return true;
+    }
+    let Ok(members) = member_ids(state, signal.conversation_id).await else { return false };
+    match members.iter().find(|&&m| m != from) {
+        Some(&other) => matches!(friends::are_friends(state, from, other).await, Ok(true)),
+        None => false,
     }
 }
 
