@@ -188,6 +188,9 @@ pub async fn delete_account(
         media::discard(&state, &id).await?;
     }
     state.calls.lock().unwrap().retain(|_, c| c.from.id != user.id && c.to != user.id);
+    // The link rows went with the user; drop what memory still holds.
+    crate::links::forget_photos(&state, user.id);
+    crate::music::forget_activity(&state, user.id).await;
     // Dropping the senders closes the sockets.
     state.sockets.lock().unwrap().remove(&user.id);
     for (id, mut members) in others {

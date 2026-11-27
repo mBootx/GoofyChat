@@ -4,7 +4,7 @@ use crate::{
     account,
     auth::{self, now_ms, Auth, UserRow},
     error::{bad, not_found, Error, Result},
-    media, messages,
+    links, media, messages, music, photos,
     state::AppState,
     ws,
 };
@@ -41,6 +41,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/messages/{id}/reaction", put(messages::react))
         .route("/api/media", post(media::upload).layer(DefaultBodyLimit::max(upload_limit)))
         .route("/api/media/{id}", get(media::download))
+        .route("/api/links", get(links::get_links))
+        .route("/api/links/navidrome", post(links::link_navidrome).delete(links::unlink_navidrome))
+        .route("/api/links/photos", post(links::link_photos).delete(links::unlink_photos))
+        .route("/api/music/search", get(music::search))
+        .route("/api/music/{id}/stream", get(music::stream))
+        .route("/api/music/{id}/cover", get(music::cover))
+        .route("/api/activity", get(music::activity))
+        .route("/api/photos", get(photos::list_photos))
+        .route("/api/photos/thumb", get(photos::thumb))
+        .route("/api/photos/import", post(photos::import))
         .route("/api/ice", get(ice))
         .route("/api/ws", get(ws::handler))
         // Authentication is a bearer header, never a cookie, so any origin is safe.

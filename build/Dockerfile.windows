@@ -1,0 +1,28 @@
+# Toolchain image that cross-builds the Windows installer on Linux. Run through
+# build/build-windows.sh, which builds the APK image (goofychat-builder) first:
+# this one reuses its Rust, trunk and tauri-cli.
+FROM goofychat-builder
+
+# NSIS makes the installer; LLVM links and compiles resources for the MSVC target.
+RUN apt-get update && apt-get install -y --no-install-recommends nsis lld llvm clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# cargo-xwin looks for the unversioned MSVC-style tool names.
+RUN v=$(ls /usr/bin/clang-[0-9]* | sed 's/.*clang-//' | sort -n | tail -n 1) \
+    && for tool in clang-cl:clang-$v lld-link:lld-link-$v llvm-lib:llvm-lib-$v llvm-rc:llvm-rc-$v \
+        llvm-ar:llvm-ar-$v llvm-dlltool:llvm-dlltool-$v; do \
+        name=${tool%%:*}; real=${tool#*:}; \
+        if ! command -v "$name" > /dev/null && [ -x "/usr/bin/$real" ]; then ln -s "/usr/bin/$real" "/usr/local/bin/$name"; fi; \
+    done
+
+RUN rustup target add x86_64-pc-windows-msvc && cargo install cargo-xwin --locked
+
+# tauri-cli on a Linux host insists on finding an appindicator library when the
+# tray-icon feature is on, even for a Windows target. It is never linked in.
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libayatana-appindicator3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Debian 12 ships NSIS 3.08; Tauri's installer script includes Win\RestartManager.nsh,
+# which arrived in NSIS 3.09. It is a plain header of constants, so take it from 3.10.
+RUN curl -fsSL -o /usr/share/nsis/Include/Win/RestartManager.nsh \
+    https://raw.githubusercontent.com/kichik/nsis/v310/Include/Win/RestartManager.nsh

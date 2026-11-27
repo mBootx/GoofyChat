@@ -97,4 +97,58 @@ extern "C" {
     pub async fn set_autostart(enabled: bool) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(js_name = appVersion)]
     pub async fn app_version() -> JsValue;
+
+    // ---- calls and recording, extras ----
+
+    /// `start_call` with the callee's photo (media id, may be empty) and user id.
+    #[wasm_bindgen(js_name = startCall)]
+    pub fn start_call_with(conversation: f64, peer: &str, video: bool, avatar: &str, peer_id: f64);
+    /// Live level bars and timer of the recording bar.
+    #[wasm_bindgen(js_name = recordMeter)]
+    pub fn record_meter(canvas_id: &str, time_id: &str);
+}
+
+/// Audio players of messages (`js/voice.js`).
+#[wasm_bindgen(module = "/js/voice.js")]
+extern "C" {
+    /// The element carries `data-media`, `data-url` and `data-kind` ("voice" or "file").
+    #[wasm_bindgen(js_name = voiceMount)]
+    pub fn voice_mount(element_id: &str);
+    #[wasm_bindgen(js_name = voiceUnmount)]
+    pub fn voice_unmount(element_id: &str);
+    #[wasm_bindgen(js_name = voiceToggle)]
+    pub fn voice_toggle(element_id: &str);
+    #[wasm_bindgen(js_name = voiceSpeed)]
+    pub fn voice_speed(element_id: &str);
+    #[wasm_bindgen(js_name = voiceStop)]
+    pub fn voice_stop();
+}
+
+/// Theme and sounds (`js/look.js`), stored per device.
+#[wasm_bindgen(module = "/js/look.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = lookGet)]
+    pub fn look_get() -> String;
+    /// Saves and applies at once.
+    #[wasm_bindgen(js_name = lookSet)]
+    pub fn look_set(json: &str);
+    /// The theme in effect is dark.
+    #[wasm_bindgen(js_name = lookDark)]
+    pub fn look_dark() -> bool;
+    #[wasm_bindgen(js_name = lookPresets)]
+    pub fn look_presets() -> String;
+    #[wasm_bindgen(js_name = soundsGet)]
+    pub fn sounds_get() -> String;
+    #[wasm_bindgen(js_name = soundsSet)]
+    pub fn sounds_set(json: &str);
+    /// "ring:<id>" or "msg:<id>". True while a ring preview plays.
+    #[wasm_bindgen(js_name = soundPreview)]
+    pub fn sound_preview(kind: &str) -> bool;
+    #[wasm_bindgen(js_name = soundStop)]
+    pub fn sound_stop();
+    #[wasm_bindgen(js_name = onPreviewEnd)]
+    pub fn on_preview_end(callback: &JsValue);
+    /// Plays the new-message sound if the user turned it on.
+    #[wasm_bindgen(js_name = messageSound)]
+    pub fn message_sound();
 }

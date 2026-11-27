@@ -6,6 +6,17 @@
   <title>Goofy Chat</title>
   <link data-trunk rel="rust" data-wasm-opt="s">
   <link data-trunk rel="css" href="style.css">
+  <link data-trunk rel="css" href="music.css">
+  <script>
+    // Applies the saved theme before the first paint (js/look.js keeps this cache).
+    try {
+      var c = JSON.parse(localStorage.getItem("goofychat.theme.cache") || "null");
+      if (c) {
+        document.documentElement.style.cssText = c.css || "";
+        for (var k in c.attrs || {}) if (c.attrs[k] != null) document.documentElement.setAttribute(k, c.attrs[k]);
+      }
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <div id="main"></div>

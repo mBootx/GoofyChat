@@ -1,10 +1,13 @@
 # Goofy Chat
 
-Self-hosted chat for Android: one-to-one and group conversations, photo, video
-and audio sending, voice messages, replies, reactions, typing indicators, read
-receipts, profile photos, a directory of all members, one-to-one voice and video calls, and notifications
-without any third-party push service. People can block each other, leave groups,
-delete their messages and delete their account. The interface is in French.
+Self-hosted chat for Android and Windows: one-to-one and group conversations,
+photo, video and audio sending, voice messages, replies, reactions, typing
+indicators, read receipts, profile photos, a directory of all members,
+one-to-one voice and video calls, and notifications without any third-party
+push service. People can block each other, leave groups,
+delete their messages and delete their account. Each device can change the
+theme, accent colour, bubble style, chat wallpaper, text size and ringtone.
+The interface is in French.
 
 There is no end-to-end encryption: HTTPS protects traffic in transit, but the
 server administrator can read messages and files.
@@ -15,9 +18,9 @@ server administrator can read messages and files.
 |---|---|
 | `server/` | Rust API and WebSocket server (axum, SQLite) |
 | `proto/` | Types shared by the server and the app |
-| `app/` | Android app: Tauri 2 shell, Dioxus UI, `js/bridge.js` for media and calls, Kotlin notification service |
+| `app/` | The app: Dioxus UI, `js/bridge.js` for media and calls, Tauri 2 shell (`src-tauri/`, with `desktop.rs` for the Windows tray, notifications and updates), Kotlin code for Android (`android/`) |
 | `deploy/` | Docker Compose stack: chat server and coturn (call relay) |
-| `build/` | Docker image and script that build the signed APK |
+| `build/` | Scripts that build the signed APK (Docker, Linux) and the Windows installer |
 
 ## Server
 
@@ -37,7 +40,44 @@ during the image build.
 - A reverse proxy must terminate HTTPS, forward to `LAN_IP:8880` with WebSocket
   support, and set `X-Real-IP`.
 - For calls, forward port `7880` (TCP and UDP) and UDP `10000-10100` on the router.
-- All data is in the `goofychat_data` Docker volume. Back it up.
+- All data is in the `goofychat_data` Docker volume. Back it up. It includes
+  `secret.key`, which signs music and photo links and encrypts the stored
+  FileBrowser passwords. Losing it means everyone must link their photos again.
+
+## SelfHost-hub (music and photos)
+
+Goofy Chat can use the services of [SelfHost-hub](https://github.com/mBootx/SelfHost-hub):
+
+- **goofysound** (Navidrome): share a song in a conversation as a card with a
+  player, use a song as a ringtone, and see what friends are listening to
+  (the Activité column on wide screens, 🎵 lines in lists and chat headers).
+- **Photos** (FileBrowser Quantum): "Mes photos SelfHost-hub" in the attach
+  menu lists the camera backups, filtered by date, and sends the chosen ones.
+
+Optional settings in `deploy/.env` (an empty value turns the feature off):
+
+```
+NAVIDROME_URL=http://navidrome:4533          # default; reached through the navidrome_default network
+FILEBROWSER_URL=https://files.example.org
+PHOTOS_FOLDER=/backups/photos/{user}         # default; {user} is the FileBrowser account name
+```
+
+The compose file attaches the server to Navidrome's existing Docker network,
+`navidrome_default`. That network must exist before `docker compose up`.
+
+Each person links their accounts once, in Réglages › SelfHost-hub, with their
+goofysound and FileBrowser usernames and passwords. The server checks them
+first, then keeps:
+
+- for goofysound, the username and a Subsonic salt and token. It never keeps
+  the password. A goofysound account can be linked to one Goofy Chat account only;
+- for Photos, the username and the password, encrypted with `secret.key`
+  (FileBrowser has no other way to log in again).
+
+Unlinking, or deleting the Goofy Chat account, removes them. Shared songs play
+for every member of the conversation, using the sharer's account. Who is
+listening is visible only to people who share a conversation with that person,
+and never between people who blocked each other.
 
 ## APK
 
@@ -49,7 +89,13 @@ Android only installs an update signed with the same key.
 
 ## Desktop (Windows)
 
-Run `powershell -ExecutionPolicy Bypass -File build\build-desktop.ps1` on
+The usual way is to cross-build on the Linux machine that builds the APK: run
+`sh build/build-windows.sh`. It builds a toolchain image on top of the APK
+image (NSIS, LLVM, cargo-xwin, which downloads the Windows SDK once and
+accepts its licence) and writes `dist/GoofyChat-setup.exe`. Tauri calls this
+cross-build experimental, and the installer is not signed.
+
+To build on Windows instead, run `powershell -ExecutionPolicy Bypass -File build\build-desktop.ps1` on
 Windows with Rust (MSVC), Visual Studio Build Tools and the WebView2 runtime.
 The first run installs nothing automatically except the wasm target; install
 the tools once with `cargo install trunk --locked` and
@@ -72,7 +118,8 @@ every six hours) and offers to install it when its version is higher. The
 repository must stay public.
 
 1. Raise `version` in `app/src-tauri/tauri.conf.json`, for example to `0.3.0`.
-2. Build the APK and the desktop installer.
+2. Build the APK and the desktop installer (`build/build-apk.sh` and
+   `build/build-windows.sh`, both on the Linux build machine).
 3. On GitHub, publish a release tagged `v0.3.0` and attach both
    `GoofyChat.apk` (rename `dist/GoofyChat.apk` if needed: the phone takes the
    first asset ending in `.apk`) and `GoofyChat-setup.exe`. Drafts and

@@ -4,7 +4,7 @@ use crate::{
     api::{is_blocked, require_member},
     auth::{now_ms, Auth},
     error::{bad, not_found, Error, Result},
-    media,
+    media, music,
     state::AppState,
 };
 use axum::{
@@ -36,6 +36,28 @@ struct MessageRow {
     reply_body: Option<String>,
     reply_mime: Option<String>,
     reply_deleted: Option<bool>,
+    track_id: Option<String>,
+    track_title: Option<String>,
+    track_artist: Option<String>,
+    track_album: Option<String>,
+    track_duration: Option<i64>,
+    track_cover: Option<bool>,
+}
+
+/// Builds the message; the state signs the track key.
+fn message_of(state: &AppState, r: MessageRow) -> Message {
+    let track = r.track_id.clone().map(|id| Track {
+        key: music::track_key(state, &id),
+        title: r.track_title.clone().unwrap_or_default(),
+        artist: r.track_artist.clone().unwrap_or_default(),
+        album: r.track_album.clone().unwrap_or_default(),
+        duration: r.track_duration.unwrap_or(0),
+        has_cover: r.track_cover.unwrap_or(false),
+        id,
+    });
+    let mut message: Message = r.into();
+    message.track = track;
+    message
 }
 
 impl From<MessageRow> for Message {
@@ -67,6 +89,7 @@ impl From<MessageRow> for Message {
             reply,
             reactions: vec![],
             deleted: r.deleted,
+            track: None,
         }
     }
 }
@@ -75,7 +98,8 @@ const SELECT: &str = "SELECT m.id, m.conversation_id, m.body, m.created_at, m.de
     u.id AS sender_id, u.username, u.display_name, u.avatar,
     f.id AS media_id, f.mime, f.name, f.size,
     m.reply_to, ru.display_name AS reply_sender, r.body AS reply_body,
-    rf.mime AS reply_mime, r.deleted AS reply_deleted
+    rf.mime AS reply_mime, r.deleted AS reply_deleted,
+    m.track_id, m.track_title, m.track_artist, m.track_album, m.track_duration, m.track_cover
     FROM messages m JOIN users u ON u.id = m.sender_id
     LEFT JOIN media f ON f.id = m.media_id
     LEFT JOIN messages r ON r.id = m.reply_to
@@ -83,7 +107,7 @@ const SELECT: &str = "SELECT m.id, m.conversation_id, m.body, m.created_at, m.de
     LEFT JOIN media rf ON rf.id = r.media_id";
 
 async fn with_reactions(state: &AppState, rows: Vec<MessageRow>) -> Result<Vec<Message>> {
-    let mut messages: Vec<Message> = rows.into_iter().map(Into::into).collect();
+    let mut messages: Vec<Message> = rows.into_iter().map(|r| message_of(state, r)).collect();
     if messages.is_empty() {
         return Ok(messages);
     }
@@ -115,7 +139,7 @@ pub async fn last(state: &AppState, conversation: i64) -> Result<Option<Message>
     let sql = format!("{SELECT} WHERE m.conversation_id = ? ORDER BY m.id DESC LIMIT 1");
     let row: Option<MessageRow> =
         sqlx::query_as(&sql).bind(conversation).fetch_optional(&state.db).await?;
-    Ok(row.map(Into::into))
+    Ok(row.map(|r| message_of(state, r)))
 }
 
 #[derive(Deserialize)]
@@ -169,7 +193,7 @@ pub async fn send(
     let members = require_member(&state, id, user.id).await?;
     require_open(&state, id, &members, user.id).await?;
     let body = input.body.trim().to_string();
-    if body.is_empty() && input.media_id.is_none() {
+    if body.is_empty() && input.media_id.is_none() && input.track_id.is_none() {
         return Err(bad("Message vide."));
     }
     if body.chars().count() > 4000 {
@@ -198,9 +222,15 @@ pub async fn send(
             .await?
             .ok_or_else(|| bad("Message d'origine introuvable."))?;
     }
+    // Looked up last: it calls goofysound, so the cheap checks come first.
+    let track = match &input.track_id {
+        Some(track_id) => Some(music::lookup(&state, user.id, track_id).await?),
+        None => None,
+    };
     let message_id = sqlx::query(
-        "INSERT INTO messages (conversation_id, sender_id, body, media_id, reply_to, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (conversation_id, sender_id, body, media_id, reply_to, created_at,
+           track_id, track_title, track_artist, track_album, track_duration, track_cover)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(user.id)
@@ -208,6 +238,12 @@ pub async fn send(
     .bind(&input.media_id)
     .bind(input.reply_to)
     .bind(now_ms())
+    .bind(track.as_ref().map(|t| &t.id))
+    .bind(track.as_ref().map(|t| &t.title))
+    .bind(track.as_ref().map(|t| &t.artist))
+    .bind(track.as_ref().map(|t| &t.album))
+    .bind(track.as_ref().map(|t| t.duration))
+    .bind(track.as_ref().map(|t| t.has_cover))
     .execute(&state.db)
     .await?
     .last_insert_rowid();
@@ -243,7 +279,10 @@ pub async fn delete(
         .fetch_one(&state.db)
         .await?;
     let mut tx = state.db.begin().await?;
-    sqlx::query("UPDATE messages SET deleted = 1, body = '', media_id = NULL WHERE id = ?")
+    sqlx::query(
+        "UPDATE messages SET deleted = 1, body = '', media_id = NULL, track_id = NULL, track_title = NULL,
+           track_artist = NULL, track_album = NULL, track_duration = NULL, track_cover = NULL WHERE id = ?",
+    )
         .bind(id)
         .execute(&mut *tx)
         .await?;

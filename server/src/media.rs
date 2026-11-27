@@ -26,7 +26,7 @@ pub fn allowed_mime(mime: &str) -> bool {
     ALLOWED.contains(&mime)
 }
 
-fn too_large(msg: &str) -> Error {
+pub fn too_large(msg: &str) -> Error {
     Error(StatusCode::PAYLOAD_TOO_LARGE, msg.into())
 }
 
@@ -58,14 +58,7 @@ pub async fn upload(
     }
     let name: String = field.file_name().unwrap_or("fichier").chars().take(120).collect();
 
-    let (mine, total): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(CASE WHEN owner_id = ? THEN size END), 0), COALESCE(SUM(size), 0) FROM media",
-    )
-    .bind(user.id)
-    .fetch_one(&state.db)
-    .await?;
-    let remaining = (state.config.user_quota.saturating_sub(mine as u64))
-        .min(state.config.total_quota.saturating_sub(total as u64));
+    let remaining = remaining(&state, user.id).await?;
 
     let id = random_hex(24);
     let path = state.config.data_dir.join("media").join(&id);
@@ -104,10 +97,22 @@ pub async fn upload(
     Ok(Json(Media { id, mime, name, size: size as i64 }))
 }
 
-struct Busy(AppState, i64);
+/// Bytes the user may still store: the smaller of their quota and the server's.
+pub async fn remaining(state: &AppState, user: i64) -> Result<u64> {
+    let (mine, total): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(CASE WHEN owner_id = ? THEN size END), 0), COALESCE(SUM(size), 0) FROM media",
+    )
+    .bind(user)
+    .fetch_one(&state.db)
+    .await?;
+    Ok((state.config.user_quota.saturating_sub(mine as u64))
+        .min(state.config.total_quota.saturating_sub(total as u64)))
+}
+
+pub struct Busy(AppState, i64);
 
 impl Busy {
-    fn claim(state: &AppState, user: i64) -> Result<Self> {
+    pub fn claim(state: &AppState, user: i64) -> Result<Self> {
         if !state.uploading.lock().unwrap().insert(user) {
             return Err(Error(StatusCode::TOO_MANY_REQUESTS, "Un envoi est déjà en cours.".into()));
         }
@@ -121,7 +126,7 @@ impl Drop for Busy {
     }
 }
 
-struct Unfinished(Option<std::path::PathBuf>);
+pub struct Unfinished(pub Option<std::path::PathBuf>);
 
 impl Drop for Unfinished {
     fn drop(&mut self) {

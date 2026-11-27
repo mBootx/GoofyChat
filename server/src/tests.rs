@@ -14,6 +14,10 @@ async fn app() -> Router {
 }
 
 async fn app_with_invite(invite_code: &str) -> Router {
+    api::router(app_state(invite_code, "").await)
+}
+
+async fn app_state(invite_code: &str, fake: &str) -> state::AppState {
     let data_dir = std::env::temp_dir().join(format!("chat-test-{}", crate::auth::random_hex(8)));
     let config = state::Config {
         data_dir,
@@ -23,8 +27,11 @@ async fn app_with_invite(invite_code: &str) -> Router {
         turn_host: "turn.test".into(),
         turn_secret: "secret".into(),
         invite_code: invite_code.into(),
+        navidrome_url: fake.into(),
+        filebrowser_url: fake.into(),
+        photos_folder: state::DEFAULT_PHOTOS_FOLDER.into(),
     };
-    api::router(state::AppState::new(config).await.unwrap())
+    state::AppState::new(config).await.unwrap()
 }
 
 async fn send(app: &Router, request: Request<Body>) -> (StatusCode, Vec<u8>) {
@@ -311,6 +318,222 @@ async fn old_databases_are_migrated() {
     state::migrate(&db).await.unwrap();
     sqlx::query("SELECT avatar FROM users").fetch_all(&db).await.unwrap();
     sqlx::query("SELECT reply_to, deleted FROM messages").fetch_all(&db).await.unwrap();
+}
+
+/// A fake goofysound (Subsonic) and FileBrowser Quantum on one port.
+/// Accounts: Navidrome `alice` / `pw`, FileBrowser `alice` / `pw`.
+async fn fake_services() -> String {
+    use axum::{extract::Query, http::HeaderMap, response::IntoResponse, routing::{get, post}};
+    use md5::{Digest, Md5};
+    use std::collections::HashMap;
+    type Q = Query<HashMap<String, String>>;
+
+    fn sub(Query(q): Q) -> Result<(), Value> {
+        let salt = q.get("s").cloned().unwrap_or_default();
+        let token: String = Md5::digest(format!("pw{salt}")).iter().map(|b| format!("{b:02x}")).collect();
+        if q.get("u").map(String::as_str) == Some("alice") && q.get("t") == Some(&token) {
+            Ok(())
+        } else {
+            Err(json!({"subsonic-response": {"status": "failed", "error": {"code": 40, "message": "Wrong"}}}))
+        }
+    }
+    fn ok(extra: Value) -> axum::Json<Value> {
+        let mut body = json!({"status": "ok", "version": "1.16.1"});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        axum::Json(json!({ "subsonic-response": body }))
+    }
+    let song = json!({"id": "s1", "title": "Song", "artist": "Artist", "album": "Album", "coverArt": "al-1", "duration": 213});
+    let fb_auth = |h: &HeaderMap| h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer a.b.c");
+
+    let (s1, s2, s3) = (song.clone(), song.clone(), song.clone());
+    let router = axum::Router::new()
+        .route("/rest/ping.view", get(|q: Q| async move { sub(q).map(|_| ok(json!({}))).unwrap_or_else(axum::Json) }))
+        .route("/rest/search3.view", get(move |q: Q| async move {
+            sub(q).map(|_| ok(json!({"searchResult3": {"song": [s1]}}))).unwrap_or_else(axum::Json)
+        }))
+        .route("/rest/getSong.view", get(move |q: Q| async move {
+            let id = q.0.get("id").cloned();
+            match sub(q) {
+                Err(e) => axum::Json(e),
+                Ok(_) if id.as_deref() == Some("s1") => ok(json!({"song": s2})),
+                Ok(_) => axum::Json(json!({"subsonic-response": {"status": "failed", "error": {"code": 70}}})),
+            }
+        }))
+        .route("/rest/getNowPlaying.view", get(move |q: Q| async move {
+            let mut entry = s3.clone();
+            entry["username"] = json!("alice");
+            entry["minutesAgo"] = json!(0);
+            entry["playerName"] = json!("SelfHost-hub");
+            sub(q).map(|_| ok(json!({"nowPlaying": {"entry": [entry]}}))).unwrap_or_else(axum::Json)
+        }))
+        .route("/rest/stream.view", get(|q: Q| async move {
+            match sub(q) {
+                Ok(_) => ([("content-type", "audio/mpeg")], b"MP3DATA".to_vec()).into_response(),
+                Err(e) => axum::Json(e).into_response(),
+            }
+        }))
+        .route("/rest/getCoverArt.view", get(|q: Q| async move {
+            match sub(q) {
+                Ok(_) => ([("content-type", "image/png")], b"PNG".to_vec()).into_response(),
+                Err(e) => axum::Json(e).into_response(),
+            }
+        }))
+        .route("/api/auth/login", post(|Query(q): Q, h: HeaderMap| async move {
+            let user = q.get("username").map(String::as_str) == Some("alice");
+            if user && h.get("x-password").and_then(|v| v.to_str().ok()) == Some("pw") {
+                ([("set-cookie", "filebrowser_quantum_jwt=a.b.c; Path=/")], "").into_response()
+            } else {
+                StatusCode::UNAUTHORIZED.into_response()
+            }
+        }))
+        .route("/api/users", get(move |h: HeaderMap| async move {
+            if !fb_auth(&h) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            axum::Json(json!({"username": "alice", "scopes": [{"name": "default"}]})).into_response()
+        }))
+        .route("/api/resources", get(move |Query(q): Q, h: HeaderMap| async move {
+            if !fb_auth(&h) || q.get("source").map(String::as_str) != Some("default") {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            let body = match q.get("path").map(String::as_str).unwrap_or("") {
+                "/backups/photos/alice" => json!({"folders": [{"name": "2026"}, {"name": "Corbeille"}], "files": []}),
+                "/backups/photos/alice/2026" => json!({"folders": [{"name": "09"}], "files": []}),
+                "/backups/photos/alice/2026/09" => json!({"folders": [], "files": [
+                    {"name": "IMG_1.jpg", "size": 8, "type": "image/jpeg", "modified": "2026-09-15T10:00:00Z"},
+                    {"name": "notes.txt", "size": 3, "type": "text/plain"},
+                ]}),
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            axum::Json(body).into_response()
+        }))
+        .route("/api/resources/preview", get(move |h: HeaderMap| async move {
+            if !fb_auth(&h) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            ([("content-type", "image/jpeg")], b"THUMB".to_vec()).into_response()
+        }))
+        .route("/api/resources/download", get(move |Query(q): Q, h: HeaderMap| async move {
+            if !fb_auth(&h) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            if q.get("file").map(String::as_str) != Some("/backups/photos/alice/2026/09/IMG_1.jpg") {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            ([("content-type", "image/jpeg")], b"JPEGDATA".to_vec()).into_response()
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    url
+}
+
+async fn get_raw(app: &Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    send(app, Request::builder().uri(uri).body(Body::empty()).unwrap()).await
+}
+
+#[tokio::test]
+async fn goofysound_links_music_and_activity() {
+    let state = app_state("", &fake_services().await).await;
+    let app = api::router(state.clone());
+    let (alice, alice_id) = account(&app, "alice").await;
+    let (bob, bob_id) = account(&app, "bob").await;
+    let (eve, _) = account(&app, "eve").await;
+
+    let link = "/api/links/navidrome";
+    let wrong = json!({"username": "alice", "password": "nope"});
+    assert_eq!(call(&app, "POST", link, &alice, wrong).await.0, StatusCode::BAD_REQUEST);
+    let right = json!({"username": "alice", "password": "pw"});
+    let (status, links) = call(&app, "POST", link, &alice, right.clone()).await;
+    assert_eq!((status, &links["navidrome"]), (StatusCode::OK, &json!("alice")));
+    assert_eq!(call(&app, "POST", link, &bob, right).await.0, StatusCode::CONFLICT, "one owner per account");
+    let row: (String, String) = sqlx::query_as("SELECT salt, token FROM navidrome_links").fetch_one(&state.db).await.unwrap();
+    assert!(!row.1.contains("pw") && row.1.len() == 32, "only a token is stored");
+
+    assert_eq!(call(&app, "GET", "/api/music/search?q=song", &bob, Value::Null).await.0, StatusCode::FORBIDDEN);
+    let (status, found) = call(&app, "GET", "/api/music/search?q=song", &alice, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found[0]["title"], "Song");
+    let key = found[0]["key"].as_str().unwrap().to_string();
+
+    let chat = direct(&app, &alice, bob_id).await.1["id"].clone();
+    let (status, sent) = say(&app, &alice, &chat, json!({"body": "", "media_id": null, "track_id": "s1"})).await;
+    assert_eq!((status, &sent["track"]["artist"]), (StatusCode::OK, &json!("Artist")));
+    let missing = json!({"body": "", "media_id": null, "track_id": "zz"});
+    assert_eq!(say(&app, &alice, &chat, missing).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(history(&app, &bob, &chat).await[0]["track"]["key"], json!(key));
+
+    let (status, bytes) = get_raw(&app, &format!("/api/music/s1/stream?k={key}")).await;
+    assert_eq!((status, bytes.as_slice()), (StatusCode::OK, &b"MP3DATA"[..]));
+    let forged = "0".repeat(64);
+    assert_eq!(get_raw(&app, &format!("/api/music/s1/stream?k={forged}")).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get_raw(&app, &format!("/api/music/s2/stream?k={key}")).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get_raw(&app, &format!("/api/music/s1/cover?k={key}")).await.0, StatusCode::OK);
+
+    crate::music::poll_activity(&state).await;
+    let (_, seen) = call(&app, "GET", "/api/activity", &bob, Value::Null).await;
+    assert_eq!(seen[0]["user_id"], alice_id);
+    assert_eq!(seen[0]["track"]["title"], "Song");
+    let (_, hidden) = call(&app, "GET", "/api/activity", &eve, Value::Null).await;
+    assert_eq!(hidden, json!([]), "only people sharing a conversation see it");
+
+    assert_eq!(call(&app, "DELETE", link, &alice, Value::Null).await.0, StatusCode::NO_CONTENT);
+    let (_, seen) = call(&app, "GET", "/api/activity", &bob, Value::Null).await;
+    assert_eq!(seen, json!([]));
+    // Nobody linked any more: shared songs stop playing.
+    assert_eq!(get_raw(&app, &format!("/api/music/s1/stream?k={key}")).await.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn photos_link_list_thumb_and_import() {
+    let state = app_state("", &fake_services().await).await;
+    let app = api::router(state.clone());
+    let (alice, _) = account(&app, "alice").await;
+    let (bob, bob_id) = account(&app, "bob").await;
+
+    assert_eq!(call(&app, "GET", "/api/photos", &alice, Value::Null).await.0, StatusCode::FORBIDDEN);
+    let link = "/api/links/photos";
+    let wrong = json!({"username": "alice", "password": "nope"});
+    assert_eq!(call(&app, "POST", link, &alice, wrong).await.0, StatusCode::BAD_REQUEST);
+    let right = json!({"username": "alice", "password": "pw"});
+    assert_eq!(call(&app, "POST", link, &alice, right).await.1["photos"], "alice");
+    let (sealed,): (String,) = sqlx::query_as("SELECT password FROM photo_links").fetch_one(&state.db).await.unwrap();
+    assert_ne!(sealed, "pw", "the password is encrypted");
+
+    let (status, page) = call(&app, "GET", "/api/photos?from=2026-01-01&to=2026-12-31", &alice, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let photos = page["photos"].as_array().unwrap();
+    assert_eq!(photos.len(), 1, "only photos and videos");
+    let path = photos[0]["path"].as_str().unwrap().to_string();
+    assert_eq!(path, "/backups/photos/alice/2026/09/IMG_1.jpg");
+    let (_, empty) = call(&app, "GET", "/api/photos?from=2027-01-01", &alice, Value::Null).await;
+    assert_eq!(empty["photos"], json!([]));
+
+    // Forget the session: the stored, encrypted password logs in again.
+    crate::links::forget_photos(&state, 1);
+    let key = photos[0]["key"].as_str().unwrap();
+    let thumb = format!("/api/photos/thumb?path={}&k={key}", path.replace('/', "%2F"));
+    assert_eq!(get_raw(&app, &thumb).await, (StatusCode::OK, b"THUMB".to_vec()));
+    let other = format!("/api/photos/thumb?path=%2Fbackups%2Fphotos%2Fbob%2Fa.jpg&k={key}");
+    assert_eq!(get_raw(&app, &other).await.0, StatusCode::FORBIDDEN);
+
+    let escape = json!({"path": "/backups/photos/alice/../bob/2026/09/IMG_1.jpg"});
+    assert_eq!(call(&app, "POST", "/api/photos/import", &alice, escape).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&app, "POST", "/api/photos/import", &bob, json!({"path": path})).await.0, StatusCode::FORBIDDEN);
+    let (status, media) = call(&app, "POST", "/api/photos/import", &alice, json!({"path": path})).await;
+    assert_eq!((status, &media["size"]), (StatusCode::OK, &json!(8)));
+    let chat = direct(&app, &alice, bob_id).await.1["id"].clone();
+    assert_eq!(say(&app, &alice, &chat, json!({"body": "", "media_id": media["id"]})).await.0, StatusCode::OK);
+    let (_, bytes) = get_raw(&app, &format!("/api/media/{}", media["id"].as_str().unwrap())).await;
+    assert_eq!(bytes, b"JPEGDATA");
+
+    let right = json!({"password": "motdepasse"});
+    assert_eq!(call(&app, "POST", "/api/account/delete", &alice, right).await.0, StatusCode::NO_CONTENT);
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM photo_links").fetch_one(&state.db).await.unwrap();
+    assert_eq!(count, 0, "links go with the account");
+    let _ = bob;
 }
 
 #[tokio::test]

@@ -183,6 +183,11 @@ pub fn Settings() -> Element {
                     }
                 }
 
+                crate::theme::Appearance {}
+                crate::theme::SoundSettings {}
+
+                crate::links::LinkedAccounts {}
+
                 if ctx.desktop {
                     DesktopSettings {}
                 }

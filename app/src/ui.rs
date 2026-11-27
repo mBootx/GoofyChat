@@ -4,6 +4,12 @@ use crate::api;
 use dioxus::prelude::*;
 use wasm_bindgen::JsValue;
 
+/// `if c { a } else { b }` for `&'static str` props: written inline in rsx, the
+/// literals would become formatted `String`s.
+pub fn pick(c: bool, a: &'static str, b: &'static str) -> &'static str {
+    if c { a } else { b }
+}
+
 #[component]
 pub fn Icon(name: &'static str) -> Element {
     let path = match name {
@@ -23,13 +29,30 @@ pub fn Icon(name: &'static str) -> Element {
         "more" => "M12 5v.01M12 12v.01M12 19v.01",
         "download" => "M12 3v12M7 10l5 5 5-5M5 21h14",
         "settings" => "M4 6h10M18 6h2M4 12h2M10 12h10M4 18h12M20 18h0M16 4v4M8 10v4M18 16v4",
+        "music" => "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
+        "play" => "M7 4.5v15l12.5-7.5z",
+        "pause" => "M8 5v14M16 5v14",
+        "image" => "M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM21 15l-5-5L5 21",
+        "search" => "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3",
+        "check" => "M20 6L9 17l-5-5",
+        "lock" => "M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4",
+        "chevron" => "M9 18l6-6-6-6",
+        "trash" => "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6",
+        "calendar" => "M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM16 2v4M8 2v4M3 10h18",
         _ => "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
     };
     rsx! { svg { view_box: "0 0 24 24", path { d: path } } }
 }
 
 #[component]
-pub fn Avatar(name: String, #[props(default)] photo: Option<String>, #[props(default)] small: bool) -> Element {
+pub fn Avatar(
+    name: String,
+    #[props(default)] photo: Option<String>,
+    #[props(default)] small: bool,
+    /// Listening to music right now: green ring and dot.
+    #[props(default)]
+    live: bool,
+) -> Element {
     let initials: String = name
         .split_whitespace()
         .take(2)
@@ -39,7 +62,12 @@ pub fn Avatar(name: String, #[props(default)] photo: Option<String>, #[props(def
     let hue = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 360;
     rsx! {
         div {
-            class: if small { "avatar small" } else { "avatar" },
+            class: match (small, live) {
+                (true, true) => "avatar small live",
+                (true, false) => "avatar small",
+                (false, true) => "avatar live",
+                (false, false) => "avatar",
+            },
             style: "background: hsl({hue} 60% 52%)",
             if let Some(id) = photo {
                 img { src: api::media_url(&id), alt: "" }
@@ -58,10 +86,20 @@ pub fn summary(body: &str, mime: Option<&str>, deleted: bool) -> String {
     if !body.is_empty() {
         return body.into();
     }
-    match mime.and_then(|m| m.split('/').next()) {
+    match mime.map(|m| m.split('/').next().unwrap_or_default()) {
         Some("image") => "📷 Photo".into(),
         Some("video") => "🎬 Vidéo".into(),
-        _ => "🎤 Audio".into(),
+        Some(_) => "🎤 Audio".into(),
+        // No text and no file: a shared song (quotes do not carry the track).
+        None => "🎵 Musique".into(),
+    }
+}
+
+/// [`summary`] of a whole message, naming a shared song.
+pub fn message_summary(message: &proto::Message) -> String {
+    match &message.track {
+        Some(track) if !message.deleted => format!("🎵 {} — {}", track.title, track.artist),
+        _ => summary(&message.body, message.media.as_ref().map(|m| m.mime.as_str()), message.deleted),
     }
 }
 

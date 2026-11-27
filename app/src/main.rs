@@ -1,8 +1,13 @@
+mod activity;
 mod api;
 mod chat;
+mod links;
+mod music;
+mod photos;
 mod js;
 mod screens;
 mod settings;
+mod theme;
 mod ui;
 
 use dioxus::core::spawn_forever;
@@ -41,6 +46,11 @@ pub struct CallView {
     pub muted: bool,
     pub camera_off: bool,
     pub message: String,
+    /// Media id of the other person's profile photo.
+    #[serde(default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub peer_id: i64,
 }
 
 /// State shared by every screen.
@@ -63,6 +73,8 @@ pub struct Ctx {
     /// Running inside the Windows (desktop) app.
     pub desktop: bool,
     pub update: Signal<Option<Update>>,
+    /// What visible members are listening to on goofysound.
+    pub activities: Signal<Vec<proto::Activity>>,
 }
 
 impl Ctx {
@@ -104,6 +116,8 @@ impl Ctx {
         self.blocked.set(vec![]);
         self.typing.set(vec![]);
         self.people_tab.set(false);
+        self.activities.set(vec![]);
+        music::stop("");
     }
 
     pub async fn refresh(mut self) {
@@ -226,6 +240,7 @@ impl Ctx {
             ServerEvent::Ready => {
                 // (Re)connected: catch up on anything missed.
                 self.load_blocked().await;
+                activity::load(self).await;
                 let open = self.screen.peek().clone();
                 match open {
                     Screen::Chat(id) => {
@@ -241,6 +256,10 @@ impl Ctx {
                 let sender = message.sender.id;
                 if self.desktop && sender != self.my_id() {
                     self.announce(&message);
+                }
+                // Optional sound (Apparence › Sons) when the message is not in view.
+                if sender != self.my_id() && !(open && js::is_active()) {
+                    js::message_sound();
                 }
                 self.typing.write().retain(|t| t.0 != sender);
                 self.push_message(message);
@@ -278,6 +297,7 @@ impl Ctx {
                     self.typing_from(user_id);
                 }
             }
+            ServerEvent::Activity { user_id, activity } => activity::apply(self, user_id, activity),
             ServerEvent::Call { .. } | ServerEvent::Pong => {}
         }
     }
@@ -294,7 +314,7 @@ impl Ctx {
             Some(name) => format!("{} · {name}", message.sender.display_name),
             None => message.sender.display_name.clone(),
         };
-        let body = ui::summary(&message.body, message.media.as_ref().map(|m| m.mime.as_str()), false);
+        let body = ui::message_summary(message);
         js::notify_desktop(&title, &body, false);
     }
 
@@ -329,6 +349,7 @@ fn App() -> Element {
         wide: Signal::new(js::is_wide()),
         desktop: js::is_desktop(),
         update: Signal::new(None),
+        activities: Signal::new(vec![]),
     });
     let mut call = use_signal(CallView::default);
 
@@ -446,6 +467,7 @@ fn App() -> Element {
                             Screen::Chat(id) => rsx! { chat::Chat { key: "{id}", id } },
                         }
                     }
+                    activity::ActivityPane {}
                 }
             } else {
                 match screen {

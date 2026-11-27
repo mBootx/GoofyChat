@@ -61,6 +61,78 @@ pub struct Media {
     pub size: i64,
 }
 
+/// A song of the goofysound (Navidrome) library.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Track {
+    /// Navidrome song id.
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    /// Seconds.
+    pub duration: i64,
+    pub has_cover: bool,
+    /// Signed by the server: grants `GET /api/music/{id}/stream?k=` and `/cover?k=`
+    /// without a bearer header, so `<audio>` and `<img>` can use them.
+    pub key: String,
+}
+
+/// What a member is listening to right now.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Activity {
+    pub user_id: i64,
+    pub track: Track,
+    /// Player name reported by Navidrome, e.g. "SelfHost-hub".
+    pub player: String,
+    /// Unix time in milliseconds when this track was first seen playing.
+    pub since: i64,
+}
+
+/// The SelfHost-hub services a Goofy Chat account is linked to.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Links {
+    /// goofysound (Navidrome) username, when linked.
+    pub navidrome: Option<String>,
+    /// FileBrowser username, when linked.
+    pub photos: Option<String>,
+}
+
+/// `POST /api/links/navidrome` and `POST /api/links/photos`. Verified against the
+/// service before anything is stored.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LinkAccount {
+    pub username: String,
+    pub password: String,
+}
+
+/// A photo or video backed up by SelfHost-hub, from `GET /api/photos`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Photo {
+    /// Path inside the user's FileBrowser space.
+    pub path: String,
+    pub name: String,
+    pub is_video: bool,
+    pub size: i64,
+    /// Unix time in milliseconds: taken date when known, else the year/month folder or modified time.
+    pub taken: i64,
+    /// Signed by the server: grants `GET /api/photos/thumb?path=&k=` without a bearer header.
+    pub key: String,
+}
+
+/// A page of `GET /api/photos`, newest first.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PhotoPage {
+    pub photos: Vec<Photo>,
+    /// Opaque cursor for the next page, none at the end.
+    pub next: Option<String>,
+}
+
+/// `POST /api/photos/import`: copies a backed-up photo into Goofy Chat and returns its [`Media`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ImportPhoto {
+    pub path: String,
+}
+
 /// The message another one answers.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Quote {
@@ -94,6 +166,9 @@ pub struct Message {
     /// Deleted by its sender: body and media are empty.
     #[serde(default)]
     pub deleted: bool,
+    /// A shared song.
+    #[serde(default)]
+    pub track: Option<Track>,
 }
 
 /// How far a member has read a conversation.
@@ -129,6 +204,9 @@ pub struct NewMessage {
     pub media_id: Option<String>,
     #[serde(default)]
     pub reply_to: Option<i64>,
+    /// Navidrome song id to share; needs a linked goofysound account.
+    #[serde(default)]
+    pub track_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -191,6 +269,9 @@ pub enum ServerEvent {
     Conversation { id: i64 },
     Read { conversation_id: i64, mark: ReadMark },
     Typing { conversation_id: i64, user_id: i64 },
+    /// A member started or stopped listening (none). Sent to everyone who shares a
+    /// conversation with them, unless blocked either way.
+    Activity { user_id: i64, activity: Option<Activity> },
     Call { from: User, signal: CallSignal },
     Pong,
 }

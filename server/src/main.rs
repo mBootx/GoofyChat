@@ -2,8 +2,11 @@ mod account;
 mod api;
 mod auth;
 mod error;
+mod links;
 mod media;
 mod messages;
+mod music;
+mod photos;
 mod state;
 mod ws;
 
@@ -30,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    tokio::spawn(music::activity_loop(state.clone()));
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr}");
@@ -39,8 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).expect("signal handler");
     term.recv().await;
+}
+
+/// Development builds on other systems.
+#[cfg(not(unix))]
+async fn shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
 }

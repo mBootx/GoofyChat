@@ -1,7 +1,7 @@
 //! Sign up and in, conversation list and new conversation.
 
 use crate::{
-    api, js,
+    activity, api, js,
     ui::{self, Avatar, Icon},
     Ctx, Screen,
 };
@@ -107,7 +107,7 @@ pub fn photo(conversation: &Conversation, me: i64) -> Option<String> {
 fn preview(c: &Conversation) -> String {
     match &c.last_message {
         None => "Aucun message".into(),
-        Some(m) => ui::summary(&m.body, m.media.as_ref().map(|f| f.mime.as_str()), m.deleted),
+        Some(m) => ui::message_summary(m),
     }
 }
 
@@ -153,10 +153,13 @@ pub fn Home() -> Element {
                 for c in conversations {
                     button { key: "{c.id}", class: if open == Some(c.id) { "row active" } else { "row" },
                         onclick: move |_| ctx.open(Screen::Chat(c.id)),
-                        Avatar { name: title(&c, me), photo: photo(&c, me) }
+                        Avatar { name: title(&c, me), photo: photo(&c, me), live: activity::peer_track(ctx, &c, me).is_some() }
                         div { class: "main",
                             div { class: "title", "{title(&c, me)}" }
                             div { class: "sub", "{preview(&c)}" }
+                            if let Some(t) = activity::peer_track(ctx, &c, me) {
+                                div { class: "listening", "{activity::line(&t)}" }
+                            }
                         }
                         div { class: "side",
                             if let Some(m) = &c.last_message {
@@ -191,7 +194,7 @@ pub fn Home() -> Element {
 }
 
 /// Opens the conversation, creating it when it does not exist yet.
-async fn start_conversation(ctx: Ctx, body: NewConversation) {
+pub(crate) async fn start_conversation(ctx: Ctx, body: NewConversation) {
     #[derive(serde::Deserialize)]
     struct Created {
         id: i64,
@@ -256,10 +259,13 @@ fn People() -> Element {
                                 });
                             }
                         },
-                        Avatar { name: u.display_name.clone(), photo: u.avatar.clone() }
+                        Avatar { name: u.display_name.clone(), photo: u.avatar.clone(), live: activity::track_of(ctx, u.id).is_some() }
                         div { class: "main",
                             div { class: "title", "{u.display_name}" }
                             div { class: "sub", "@{u.username}" }
+                            if let Some(t) = activity::track_of(ctx, u.id) {
+                                div { class: "listening", "{activity::line(&t)}" }
+                            }
                         }
                     }
                 }

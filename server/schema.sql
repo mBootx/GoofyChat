@@ -49,7 +49,34 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at      INTEGER NOT NULL,
     -- Not a foreign key: the answer outlives the original.
     reply_to        INTEGER,
-    deleted         INTEGER NOT NULL DEFAULT 0
+    deleted         INTEGER NOT NULL DEFAULT 0,
+    -- A shared goofysound song, copied when it was sent.
+    track_id        TEXT,
+    track_title     TEXT,
+    track_artist    TEXT,
+    track_album     TEXT,
+    track_duration  INTEGER,
+    track_cover     INTEGER
+);
+
+-- goofysound (Navidrome) account of a user: never the password, only a
+-- Subsonic salt and token (md5(password + salt)).
+CREATE TABLE IF NOT EXISTS navidrome_links (
+    user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    username   TEXT NOT NULL,
+    -- One Goofy Chat account per Navidrome user.
+    username_key TEXT NOT NULL UNIQUE,
+    salt       TEXT NOT NULL,
+    token      TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+-- FileBrowser account of a user. The password is encrypted with the server secret.
+CREATE TABLE IF NOT EXISTS photo_links (
+    user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    username   TEXT NOT NULL,
+    password   TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS reactions (

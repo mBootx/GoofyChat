@@ -20,6 +20,10 @@ hmac = "0.12"
 base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# rustls only: the runtime image has no OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+chacha20poly1305 = "0.10"
+md-5 = "0.10"
 
 [profile.release]
 strip = true

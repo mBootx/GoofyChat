@@ -213,36 +213,13 @@ export async function appVersion() {
   try { return String(await invoke("app_version")); } catch { return ""; }
 }
 
-// Ring tone for incoming calls on desktop, where no system ringer exists.
-let ringing = null;
+// Ring tone for incoming calls while the call screen is shown (look.js plays
+// the chosen tone or goofysound song). On Android the system rings through the
+// call notification while the app is hidden, so the page stays quiet then.
 function ringer(on) {
-  if (!tauri) return;
-  if (!on) {
-    if (ringing) { clearInterval(ringing.timer); ringing.audio.close().catch(() => {}); ringing = null; }
-    return;
-  }
-  if (ringing) return;
-  try {
-    const audio = new AudioContext();
-    const beep = () => {
-      const t = audio.currentTime;
-      [[0, 784], [0.18, 988], [0.36, 784], [0.54, 988]].forEach(([at, freq]) => {
-        const osc = audio.createOscillator();
-        const gain = audio.createGain();
-        osc.type = "sine";
-        osc.frequency.value = freq;
-        gain.gain.setValueAtTime(0.0001, t + at);
-        gain.gain.exponentialRampToValueAtTime(0.18, t + at + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, t + at + 0.16);
-        osc.connect(gain).connect(audio.destination);
-        osc.start(t + at);
-        osc.stop(t + at + 0.17);
-      });
-    };
-    beep();
-    ringing = { audio, timer: setInterval(beep, 2200) };
-  } catch {}
+  window.GoofyLook?.ring(on && !(android && document.hidden));
 }
+document.addEventListener("visibilitychange", () => ringer(call?.state === "incoming"));
 
 // ---- uploads ----
 
@@ -282,11 +259,79 @@ let generation = 0;
 
 export function cancelRecording() {
   generation++;
+  closeMeter();
   const active = recorder;
   recorder = null;
   if (!active) return;
   active.stop();
   active.stream.getTracks().forEach((t) => t.stop());
+}
+
+// Live input level while recording, for the recording bar.
+let meter = null; // { ctx, analyser, data, start, levels, last }
+
+function openMeter(stream) {
+  meter = { start: Date.now(), levels: [], last: 0 };
+  try {
+    const ctx = new AudioContext();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    Object.assign(meter, { ctx, analyser, data: new Uint8Array(analyser.fftSize) });
+  } catch {}
+}
+
+function closeMeter() {
+  meter?.ctx?.close().catch(() => {});
+  meter = null;
+}
+
+/// Draws scrolling level bars into the canvas and the elapsed time into the
+/// `data-t` attribute of the time element, until the recording ends.
+export function recordMeter(canvasId, timeId) {
+  const loop = () => {
+    const canvas = document.getElementById(canvasId);
+    if (!meter || !canvas) return;
+    const now = Date.now();
+    let level = 0;
+    if (meter.analyser) {
+      meter.analyser.getByteTimeDomainData(meter.data);
+      let sum = 0;
+      for (const v of meter.data) sum += (v - 128) * (v - 128);
+      level = Math.min(1, Math.sqrt(sum / meter.data.length) / 40);
+    } else {
+      level = 0.15 + 0.1 * Math.sin(now / 120);
+    }
+    if (now - meter.last > 70) {
+      meter.last = now;
+      meter.levels.push(level);
+      if (meter.levels.length > 120) meter.levels.shift();
+    }
+    const s = Math.floor((now - meter.start) / 1000);
+    const time = document.getElementById(timeId);
+    if (time) time.dataset.t = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+    const ratio = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (canvas.width !== Math.round(w * ratio)) canvas.width = Math.round(w * ratio);
+    if (canvas.height !== Math.round(h * ratio)) canvas.height = Math.round(h * ratio);
+    const g = canvas.getContext("2d");
+    g.setTransform(ratio, 0, 0, ratio, 0, 0);
+    g.clearRect(0, 0, w, h);
+    g.fillStyle = getComputedStyle(canvas).color;
+    const step = 5, bar = 3;
+    const count = Math.floor(w / step);
+    const shown = meter.levels.slice(-count);
+    shown.forEach((v, i) => {
+      const bh = Math.max(3, Math.pow(v, 0.6) * (h - 2));
+      const x = w - (shown.length - i) * step;
+      g.globalAlpha = 0.45 + 0.55 * (i / Math.max(1, shown.length));
+      g.beginPath();
+      if (g.roundRect) g.roundRect(x, (h - bh) / 2, bar, bh, 1.5); else g.rect(x, (h - bh) / 2, bar, bh);
+      g.fill();
+    });
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
 }
 
 export async function startRecording() {
@@ -310,6 +355,7 @@ export async function startRecording() {
   recorder = new MediaRecorder(stream);
   recorder.ondataavailable = (e) => chunks.push(e.data);
   recorder.start();
+  openMeter(stream);
   return true;
 }
 
@@ -317,6 +363,7 @@ export async function stopRecording() {
   const active = recorder;
   if (!active) return "";
   recorder = null;
+  closeMeter();
   await new Promise((done) => { active.onstop = done; active.stop(); });
   active.stream.getTracks().forEach((t) => t.stop());
   const type = (active.mimeType || "audio/webm").split(";")[0];
@@ -332,9 +379,31 @@ export function onCallState(callback) { report = callback; }
 
 function publish(message = "") {
   ringer(call?.state === "incoming");
+  if (call?.state === "connected" && !call.since) call.since = Date.now();
+  callTimer();
+  if (call) window.dispatchEvent(new Event("goofy-call")); // pauses voice messages
   report(JSON.stringify(call
-    ? { state: call.state, video: call.video, peer: call.peer, muted: !!call.muted, cameraOff: !!call.cameraOff, message }
-    : { state: "idle", video: false, peer: "", muted: false, cameraOff: false, message }));
+    ? { state: call.state, video: call.video, peer: call.peer, avatar: call.avatar || null, peerId: call.peerId || 0,
+        muted: !!call.muted, cameraOff: !!call.cameraOff, message }
+    : { state: "idle", video: false, peer: "", avatar: null, peerId: 0, muted: false, cameraOff: false, message }));
+}
+
+// Call duration, written into the `data-t` attribute of #call-timer.
+let durationTimer = null;
+function callTimer() {
+  const since = call?.since;
+  clearInterval(durationTimer);
+  durationTimer = null;
+  if (!since) return;
+  const show = () => {
+    const el = document.getElementById("call-timer");
+    if (!el) return;
+    const s = Math.floor((Date.now() - since) / 1000);
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    el.dataset.t = (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(s % 60).padStart(2, "0");
+  };
+  requestAnimationFrame(show);
+  durationTimer = setInterval(show, 1000);
 }
 
 function signal(action, payload = null, target = call) {
@@ -415,9 +484,13 @@ function expire(current, seconds) {
   }, seconds * 1000);
 }
 
-export async function startCall(conversation, peer, video) {
+// `avatar` (media id of the callee's photo) and `peerId` are optional.
+export async function startCall(conversation, peer, video, avatar, peerId) {
   if (call) return;
-  const current = { id: crypto.randomUUID(), conversation, peer, video, state: "calling", queued: [] };
+  const current = {
+    id: crypto.randomUUID(), conversation, peer, video, state: "calling", queued: [],
+    avatar: avatar || null, peerId: peerId || 0,
+  };
   call = current;
   publish();
   try {
@@ -489,7 +562,10 @@ async function handleSignal(from, s) {
   if (s.action === "invite") {
     if (call?.id === s.call_id) return;
     if (call) return signal("reject", null, { id: s.call_id, conversation: s.conversation_id, video: s.video });
-    call = { id: s.call_id, conversation: s.conversation_id, video: s.video, peer: from.display_name, state: "incoming", queued: [] };
+    call = {
+      id: s.call_id, conversation: s.conversation_id, video: s.video, peer: from.display_name, state: "incoming", queued: [],
+      avatar: from.avatar || null, peerId: from.id,
+    };
     expire(call, 45);
     notifyDesktop(from.display_name, s.video ? "Appel vidéo entrant" : "Appel entrant", true);
     return publish();
