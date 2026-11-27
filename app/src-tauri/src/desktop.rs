@@ -1,5 +1,6 @@
-//! Desktop shell: tray icon, single instance, notifications, start with the
-//! system, camera and microphone permission, and self-update from GitHub.
+//! Desktop shell (Windows and Linux): tray icon, single instance, notifications,
+//! start with the system, camera and microphone permission, and self-update
+//! from GitHub (the installer on Windows, the AppImage on Linux).
 //!
 //! Closing the window only hides it, so the page and its WebSocket keep running
 //! and can announce messages and calls without any push service.
@@ -15,7 +16,8 @@ use tauri::{AppHandle, Builder, Manager, Runtime, State, UserAttentionType, Webv
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const LATEST: &str = "https://api.github.com/repos/mBootx/GoofyChat/releases/latest";
-const ASSET: &str = "GoofyChat-setup.exe";
+/// The release asset this platform installs. Linux updates only the AppImage.
+const ASSET: &str = if cfg!(windows) { "GoofyChat-setup.exe" } else { "GoofyChat.AppImage" };
 /// Passed by the system when the app starts with the session: stay in the tray.
 const AUTOSTART: &str = "--autostart";
 const TRAY: &str = "main";
@@ -89,7 +91,7 @@ pub fn setup(builder: Builder<Wry>) -> Builder<Wry> {
             tray.build(app)?;
 
             if let Some(window) = app.get_webview_window("main") {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 allow_media(&window);
                 if !std::env::args().any(|a| a == AUTOSTART) {
                     let _ = window.show();
@@ -154,7 +156,33 @@ fn toast<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str, call: bool) {
     let _ = toast.show();
 }
 
-#[cfg(not(windows))]
+/// A notification through the desktop's notification server (D-Bus). Clicking
+/// it brings the window back.
+#[cfg(target_os = "linux")]
+fn toast<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str, call: bool) {
+    use notify_rust::{Hint, Notification, Timeout, Urgency};
+    let mut note = Notification::new();
+    note.appname("Goofy Chat").summary(title).body(body).action("default", "Ouvrir");
+    if call {
+        // The page rings by itself; the notification stays longer.
+        note.urgency(Urgency::Critical).timeout(Timeout::Milliseconds(30_000));
+    } else {
+        note.hint(Hint::SoundName("message-new-instant".into()));
+    }
+    let handle = app.clone();
+    // Waiting for the click blocks until the notification is closed.
+    std::thread::spawn(move || {
+        if let Ok(shown) = note.show() {
+            shown.wait_for_action(|action| {
+                if action == "default" {
+                    show(&handle);
+                }
+            });
+        }
+    });
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn toast<R: Runtime>(app: &AppHandle<R>, _title: &str, _body: &str, _call: bool) {
     if let Some(window) = main_window(app) {
         let _ = window.request_user_attention(Some(UserAttentionType::Informational));
@@ -244,6 +272,10 @@ fn latest(current: &str) -> Result<Option<Release>, String> {
         serde_json::from_reader(response.into_reader()).map_err(|e| e.to_string())?;
     let tag = release["tag_name"].as_str().unwrap_or_default();
     let (Some(found), Some(mine)) = (parse_version(tag), parse_version(current)) else { return Ok(None) };
+    // On Linux only the AppImage can replace itself; a package or a plain build cannot.
+    if cfg!(target_os = "linux") && std::env::var_os("APPIMAGE").is_none() {
+        return Ok(None);
+    }
     if found <= mine || release["draft"].as_bool() == Some(true) || release["prerelease"].as_bool() == Some(true) {
         return Ok(None);
     }
@@ -256,7 +288,7 @@ fn latest(current: &str) -> Result<Option<Release>, String> {
     Ok(url.map(|url| Release { version: tag.trim_start_matches(['v', 'V']).to_string(), url: url.to_string() }))
 }
 
-/// The newer release with a Windows installer, if any.
+/// The newer release with this platform's asset, if any.
 #[tauri::command]
 async fn check_update(app: AppHandle, shell: State<'_, Shell>) -> Result<Option<Release>, String> {
     let current = app.package_info().version.to_string();
@@ -267,25 +299,66 @@ async fn check_update(app: AppHandle, shell: State<'_, Shell>) -> Result<Option<
     Ok(found)
 }
 
-fn download(url: &str, version: &str) -> Result<std::path::PathBuf, String> {
-    let dir = std::env::temp_dir().join("GoofyChat-update");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let target = dir.join(format!("GoofyChat-setup-{version}.exe"));
-    let partial = dir.join("download.part");
+/// Downloads `url` into `partial`, refusing a file too small to be an installer.
+fn download(url: &str, partial: &std::path::Path) -> Result<(), String> {
     let response = agent()?.get(url).call().map_err(|e| e.to_string())?;
-    let mut file = std::fs::File::create(&partial).map_err(|e| e.to_string())?;
+    let mut file = std::fs::File::create(partial).map_err(|e| e.to_string())?;
     let written = std::io::copy(&mut response.into_reader(), &mut file).map_err(|e| e.to_string())?;
     drop(file);
     if written < 100_000 {
+        let _ = std::fs::remove_file(partial);
         return Err("Fichier d'installation incomplet.".into());
     }
-    let _ = std::fs::remove_file(&target);
-    std::fs::rename(&partial, &target).map_err(|e| e.to_string())?;
-    Ok(target)
+    Ok(())
 }
 
-/// Downloads the installer found by `check_update`, starts it and quits: the
-/// installer replaces the app and starts the new version.
+#[cfg(windows)]
+fn apply(release: &Release) -> Result<(), String> {
+    let dir = std::env::temp_dir().join("GoofyChat-update");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let installer = dir.join(format!("GoofyChat-setup-{}.exe", release.version));
+    let partial = dir.join("download.part");
+    download(&release.url, &partial)?;
+    let _ = std::fs::remove_file(&installer);
+    std::fs::rename(&partial, &installer).map_err(|e| e.to_string())?;
+    // Tauri's NSIS installer: /P passive (progress bar only, closes the running
+    // app), /UPDATE keeps shortcuts and the start-with-Windows entry, /R
+    // starts the new version at the end.
+    std::process::Command::new(&installer)
+        .args(["/P", "/UPDATE", "/R"])
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("Impossible de lancer l'installation : {e}"))
+}
+
+/// Replaces the AppImage file in place (the running copy keeps its mounted
+/// image), then starts the new one once this instance has quit, since a second
+/// instance would only bring this window back.
+#[cfg(not(windows))]
+fn apply(release: &Release) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let current = std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .ok_or("Mise à jour possible seulement depuis l'AppImage.")?;
+    let dir = current.parent().ok_or("Dossier de l'AppImage introuvable.")?;
+    let partial = dir.join(".GoofyChat.AppImage.part");
+    download(&release.url, &partial).map_err(|e| format!("Téléchargement impossible dans {} : {e}", dir.display()))?;
+    std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, &current).map_err(|e| e.to_string())?;
+    let mut restart = std::process::Command::new("/bin/sh");
+    restart.args(["-c", "sleep 2; exec \"$0\""]).arg(&current);
+    // Paths into this copy's mounted image, which goes away when it quits.
+    for name in ["APPIMAGE", "APPDIR", "ARGV0", "OWD", "GDK_PIXBUF_MODULE_FILE", "GIO_MODULE_DIR", "GTK_PATH",
+        "GTK_EXE_PREFIX", "GTK_DATA_PREFIX", "GSETTINGS_SCHEMA_DIR", "GST_PLUGIN_SYSTEM_PATH",
+        "GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SCANNER", "GST_PLUGIN_SCANNER_1_0"]
+    {
+        restart.env_remove(name);
+    }
+    restart.spawn().map(drop).map_err(|e| format!("Impossible de relancer Goofy Chat : {e}"))
+}
+
+/// Downloads the update found by `check_update`, installs it and quits; the
+/// new version starts by itself.
 #[tauri::command]
 async fn install_update(app: AppHandle, shell: State<'_, Shell>, url: String) -> Result<(), String> {
     let release = shell.update.lock().unwrap().clone();
@@ -295,18 +368,9 @@ async fn install_update(app: AppHandle, shell: State<'_, Shell>, url: String) ->
     if shell.installing.swap(true, Ordering::SeqCst) {
         return Err("Installation déjà en cours.".into());
     }
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let installer = download(&release.url, &release.version)?;
-        // Tauri's NSIS installer: /P passive (progress bar only, closes the running
-        // app), /UPDATE keeps shortcuts and the start-with-Windows entry, /R
-        // starts the new version at the end.
-        std::process::Command::new(&installer)
-            .args(["/P", "/UPDATE", "/R"])
-            .spawn()
-            .map_err(|e| format!("Impossible de lancer l'installation : {e}"))
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let result = tauri::async_runtime::spawn_blocking(move || apply(&release))
+        .await
+        .map_err(|e| e.to_string())?;
     match result {
         Ok(_) => {
             app.exit(0);
@@ -348,5 +412,33 @@ fn allow_media(window: &WebviewWindow) {
         }));
         let mut token = 0i64;
         let _ = core.add_PermissionRequested(&handler, &mut token);
+    });
+}
+
+// ---- WebKitGTK ----
+
+/// Turns on media capture and WebRTC, lets sounds play without a click (the
+/// ringtone), and grants the microphone and camera to the app's own page.
+/// Without a handler WebKitGTK denies every capture request.
+#[cfg(target_os = "linux")]
+fn allow_media(window: &WebviewWindow) {
+    let _ = window.with_webview(|webview| {
+        use webkit2gtk::glib::prelude::*;
+        use webkit2gtk::{PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt};
+
+        let view = webview.inner();
+        if let Some(settings) = WebViewExt::settings(&view) {
+            settings.set_enable_media_stream(true);
+            settings.set_enable_webrtc(true);
+            settings.set_media_playback_requires_user_gesture(false);
+        }
+        view.connect_permission_request(|view, request| {
+            let own = view.uri().is_some_and(|uri| uri.starts_with("tauri://localhost"));
+            if own && request.downcast_ref::<UserMediaPermissionRequest>().is_some() {
+                request.allow();
+                return true;
+            }
+            false
+        });
     });
 }

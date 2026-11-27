@@ -1,0 +1,13 @@
+# Toolchain image that builds the Linux AppImage. Run through build/build-linux.sh,
+# which builds the APK image (goofychat-builder) first: this one reuses its Rust,
+# trunk and tauri-cli. Debian 12, so the AppImage needs glibc 2.36 or newer.
+FROM goofychat-builder
+
+# WebKitGTK and the tray library to link against; GStreamer plugins are copied
+# into the AppImage so voice notes, music, ringtones and calls can play.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev \
+        file xdg-utils patchelf \
+        gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+        gstreamer1.0-nice gstreamer1.0-gl \
+    && rm -rf /var/lib/apt/lists/*

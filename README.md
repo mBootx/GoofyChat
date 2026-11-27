@@ -111,6 +111,22 @@ the tools once with `cargo install trunk --locked` and
   named exactly `GoofyChat-setup.exe`. No signing key is needed, but Windows
   SmartScreen may warn on the first install because the installer is unsigned.
 
+## Desktop (Linux)
+
+Run `sh build/build-linux.sh` on the Linux build machine. The result is
+`dist/GoofyChat.AppImage` (x86_64, about 160 MB because it carries WebKitGTK and
+the GStreamer plugins for sound, video and calls). It runs on distributions
+with glibc 2.36 or newer (Debian 12, Ubuntu 23.04, Fedora 37 and later), not on
+Ubuntu 22.04.
+
+- Make it executable (`chmod +x GoofyChat.AppImage`) and start it. Keep it in a
+  folder you can write to, such as `~/Applications`: updates replace the file.
+- Same shell as on Windows: tray icon, notifications through the desktop's
+  notification server, start with the session.
+- Updates: the AppImage checks the latest GitHub release, downloads the asset
+  named exactly `GoofyChat.AppImage` over itself and restarts.
+- Calls depend on WebRTC support in the bundled WebKitGTK; try them first.
+
 ## Releasing an update
 
 The app looks at the latest release of `mBootx/GoofyChat` when opened (at most
@@ -118,12 +134,13 @@ every six hours) and offers to install it when its version is higher. The
 repository must stay public.
 
 1. Raise `version` in `app/src-tauri/tauri.conf.json`, for example to `0.3.0`.
-2. Build the APK and the desktop installer (`build/build-apk.sh` and
-   `build/build-windows.sh`, both on the Linux build machine).
-3. On GitHub, publish a release tagged `v0.3.0` and attach both
+2. Build the APK and the desktop apps (`build/build-apk.sh`,
+   `build/build-windows.sh` and `build/build-linux.sh`, all on the Linux build
+   machine).
+3. On GitHub, publish a release tagged `v0.3.0` and attach
    `GoofyChat.apk` (rename `dist/GoofyChat.apk` if needed: the phone takes the
-   first asset ending in `.apk`) and `GoofyChat-setup.exe`. Drafts and
-   pre-releases are ignored.
+   first asset ending in `.apk`), `GoofyChat-setup.exe` and
+   `GoofyChat.AppImage`. Drafts and pre-releases are ignored.
 
 Always sign with the same key, or Android refuses the update. Anyone who can
 publish a release can offer an update, so protect the GitHub account.
