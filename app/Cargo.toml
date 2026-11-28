@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 proto = { path = "../proto" }
-dioxus = { version = "0.7", default-features = false, features = ["launch", "web", "macro", "html", "signals", "hooks"] }
+dioxus = { version = "0.7", default-features = false, features = ["launch", "web", "macro", "html", "signals", "hooks", "mounted"] }
 gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 futures-channel = "0.3"
