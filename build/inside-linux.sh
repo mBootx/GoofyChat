@@ -9,6 +9,9 @@ cd /work/project-linux/app
 
 trunk build --release
 cargo tauri icon icon.svg
+# The target volume is kept between builds: drop older AppImages so the one copied
+# below is the one built now.
+rm -rf "$CARGO_TARGET_DIR/release/bundle/appimage"
 # --verbose shows linuxdeploy's own messages when packaging fails.
 cargo tauri build --bundles appimage --verbose
 

@@ -9,6 +9,9 @@ cd /work/project-windows/app
 
 trunk build --release
 cargo tauri icon icon.svg
+# The target volume is kept between builds: drop older installers so the one copied
+# below is the one built now.
+rm -rf "$CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis"
 cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis
 
 setup=$(find "$CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis" -name '*-setup.exe' | head -n 1)
